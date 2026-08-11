@@ -1,6 +1,7 @@
 """Unit tests for data processing in speculators.train.data."""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from speculators.train.data import (
     _pad_samples,
 )
 from speculators.train.data_types import DatasetRecord
+from speculators.train.hidden_states_source import build_client_item
 from speculators.train.recovery import (
     RECOVERY_METADATA_KEY,
     RecoveryMetadata,
@@ -662,3 +664,28 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     client = source.client
     assert isinstance(client, _QueuedAsyncOpenAI)
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
+
+
+def test_dataset_record_decodes_json_serialized_messages():
+    """Messages stored as a JSON string decode to the structured conversation."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": "file:///img.png"}},
+            ],
+        },
+        {"role": "assistant", "content": "It is blank."},
+    ]
+    row = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "loss_mask": torch.tensor([0, 1, 1]),
+        "seq_len": 3,
+        "messages": json.dumps(messages),
+    }
+
+    record = DatasetRecord.from_arrow_row(row, storage_index=0)
+
+    assert record.messages == messages
+    assert build_client_item(record)["messages"] == messages

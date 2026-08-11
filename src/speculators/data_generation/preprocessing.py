@@ -437,7 +437,12 @@ def _append_boundary_rows(
             num_kept += 1
             if "messages" in results:
                 messages = _adapt_conv_for_vllm(row["conv"])
-                results["messages"].append(messages)
+                # Serialized to JSON: conversations are heterogeneous (optional
+                # tool_calls, str vs typed-part-list content), so storing them
+                # structured lets each `map` shard infer a different Arrow
+                # schema and the final concatenation fails with "The features
+                # can't be aligned". Decoded in `DatasetRecord.from_arrow_row`.
+                results["messages"].append(json.dumps(messages))
                 results["is_multimodal"].append(has_multimodal_content(messages))
 
     return num_kept, num_unsupervised, num_maybe_truncated
