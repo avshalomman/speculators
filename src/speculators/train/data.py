@@ -156,6 +156,17 @@ class BaseDataset(Dataset):
         return data
 
 
+def _strided_val_indices(n: int, train_ratio: float) -> list[int]:
+    """File indices held out for validation: ``n - int(n * train_ratio)`` of them,
+    evenly spaced over ``[0, n)``. The count matches what a contiguous split would
+    hold out, so ``len(train) == int(n * train_ratio)`` exactly; only *which* rows
+    changes. Spacing is at least one row, so the indices are distinct and ascending."""
+    n_val = n - int(n * train_ratio)
+    if n_val <= 0:
+        return []
+    return [int((k + 0.5) * n / n_val) for k in range(n_val)]
+
+
 class ArrowDataset(BaseDataset):
     def __init__(
         self,
@@ -179,19 +190,30 @@ class ArrowDataset(BaseDataset):
         if split == "val" and train_ratio == 1.0:
             raise ValueError("train_ratio=1.0 leaves no validation split")
 
-        # Both splits derive their boundary from this one expression,
-        # so they are exactly complementary.
-        split_idx = int(len(self.data) * train_ratio)
-        start, stop = (
-            (0, split_idx) if split == "train" else (split_idx, len(self.data))
-        )
-        if start >= stop:
+        # Validation rows are held out at an even stride, not as a trailing block. The
+        # file is in whatever order it was written: a sharded preparation concatenates
+        # its parts family by family, so the last 10% of rows is not a sample of the
+        # data, it is the last few dataset families -- entirely absent from training
+        # and the only thing validation ever sees. Striding keeps every region of the
+        # file in both splits. Both splits derive from the one index list, so they are
+        # exactly complementary, and file indices (which name the hidden states on
+        # disk) are untouched.
+        n = len(self.data)
+        val_indices = _strided_val_indices(n, train_ratio)
+        if split == "val":
+            indices = val_indices
+        else:
+            held_out = set(val_indices)
+            indices = [i for i in range(n) if i not in held_out]
+        if not indices:
             raise ValueError(
-                f"{split} split is empty (dataset has {len(self.data)} rows, "
-                f"train_ratio={train_ratio} gives split_idx={split_idx})"
+                f"{split} split is empty (dataset has {n} rows, "
+                f"train_ratio={train_ratio} holds out {len(val_indices)})"
             )
-        self.start_file_idx = start
-        self.data = self.data.select(range(start, stop))
+        # None when nothing is held out: the mapping is then the identity, and a list
+        # of n ints would buy nothing.
+        self.file_indices: list[int] | None = None if len(indices) == n else indices
+        self.data = self.data.select(indices)
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
         self.vllm_endpoint = vllm_endpoint
@@ -206,7 +228,9 @@ class ArrowDataset(BaseDataset):
         super().__init__(max_len, transform, hidden_states_dtype)
 
     def _map_to_file_idx(self, index: int):
-        return index + self.start_file_idx
+        if self.file_indices is None:
+            return index
+        return self.file_indices[index]
 
     def _setup_client(self):
         self.client = openai.OpenAI(

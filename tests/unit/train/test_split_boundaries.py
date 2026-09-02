@@ -42,9 +42,12 @@ def test_splits_are_exactly_complementary(tmp_path, ratio, n):
 
     assert len(train) + len(val) == n, "splits must partition the dataset"
     assert len(train) == int(n * ratio)
-    assert val.start_file_idx == len(train), "val must begin where train ends"
     assert len(train) > 0
     assert len(val) > 0
+    train_files = {train._map_to_file_idx(i) for i in range(len(train))}
+    val_files = {val._map_to_file_idx(i) for i in range(len(val))}
+    assert not (train_files & val_files), "a file index is in both splits"
+    assert train_files | val_files == set(range(n)), "every file index is in one split"
 
 
 @pytest.mark.parametrize("ratio", [0.2, 0.9])
@@ -57,6 +60,34 @@ def test_no_row_appears_in_both_splits(tmp_path, ratio):
     train_ids = {tuple(train.data[i]["input_ids"]) for i in range(len(train))}
     val_ids = {tuple(val.data[i]["input_ids"]) for i in range(len(val))}
     assert not (train_ids & val_ids), "a row is in both train and val"
+
+
+@pytest.mark.parametrize("ratio", [0.5, 0.9, 0.95])
+def test_val_rows_are_spread_across_the_file_not_taken_from_its_tail(tmp_path, ratio):
+    """A sharded preparation writes the file family by family, so a trailing block
+    would hold out whole families. Held-out rows must come from every region."""
+    n = 10_000
+    path = _dataset(tmp_path, n)
+    val = _split(path, ratio, "val")
+
+    files = sorted(val._map_to_file_idx(i) for i in range(len(val)))
+    stride = n / len(files)
+    assert files[0] < stride, "first held-out row is within one stride of the start"
+    assert files[-1] >= n - stride, "last held-out row is within one stride of the end"
+    gaps = [b - a for a, b in zip(files, files[1:], strict=False)]
+    assert max(gaps) <= stride + 1, (
+        f"held-out rows bunch up: max gap {max(gaps)} vs stride {stride:.1f}"
+    )
+
+
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_file_indices_name_the_rows_actually_selected(tmp_path, split):
+    """The fixture stores each row's original index as input_ids[0], so the mapping
+    that names hidden-state files can be checked against the row it returns."""
+    path = _dataset(tmp_path, 1000)
+    ds = _split(path, 0.9, split)
+    for i in range(len(ds)):
+        assert ds.data[i]["input_ids"][0] == ds._map_to_file_idx(i)
 
 
 def test_default_takes_whole_dataset(tmp_path):
