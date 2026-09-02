@@ -48,6 +48,17 @@ def create_empty_batch(
     }
 
 
+def _strided_val_indices(n: int, train_ratio: float) -> list[int]:
+    """Storage indices held out for validation: ``n - int(n * train_ratio)`` of
+    them, evenly spaced over ``[0, n)``, so ``len(train) == int(n * train_ratio)``
+    as with a contiguous split. Spacing is at least one row, so the indices are
+    distinct and ascending."""
+    n_val = n - int(n * train_ratio)
+    if n_val <= 0:
+        return []
+    return [int((k + 0.5) * n / n_val) for k in range(n_val)]
+
+
 class ArrowDataset(Dataset):
     """Load preprocessed Arrow rows and expose them as dataset records."""
 
@@ -64,23 +75,33 @@ class ArrowDataset(Dataset):
         if split == "val" and train_ratio == 1.0:
             raise ValueError("train_ratio=1.0 leaves no validation split")
 
-        # Both splits derive their boundary from this one expression,
-        # so they are exactly complementary.
-        split_idx = int(len(self.data) * train_ratio)
-        start, stop = (
-            (0, split_idx) if split == "train" else (split_idx, len(self.data))
-        )
-        if start >= stop:
+        # Validation rows are held out at an even stride, not as a trailing block.
+        # A sharded preparation concatenates its parts family by family, so the
+        # last rows of the file are the last few dataset families, not a sample.
+        # Both splits derive from one index list, so they are exactly
+        # complementary, and storage indices (which name the hidden states on
+        # disk) are untouched.
+        n = len(self.data)
+        val_indices = _strided_val_indices(n, train_ratio)
+        if split == "val":
+            indices = val_indices
+        else:
+            held_out = set(val_indices)
+            indices = [i for i in range(n) if i not in held_out]
+        if not indices:
             raise ValueError(
-                f"{split} split is empty (dataset has {len(self.data)} rows, "
-                f"train_ratio={train_ratio} gives split_idx={split_idx}"
+                f"{split} split is empty (dataset has {n} rows, "
+                f"train_ratio={train_ratio} holds out {len(val_indices)})"
             )
-        self.start_storage_index = start
-        self.data = self.data.select(range(start, stop))
+        # None when nothing is held out: the mapping is then the identity.
+        self.storage_indices: list[int] | None = None if len(indices) == n else indices
+        self.data = self.data.select(indices)
         self.approx_lengths = list(self.data.with_format(None)["seq_len"])
 
     def _map_to_storage_index(self, index: int) -> int:
-        return index + self.start_storage_index
+        if self.storage_indices is None:
+            return index
+        return self.storage_indices[index]
 
     def __len__(self) -> int:
         return len(self.data)
