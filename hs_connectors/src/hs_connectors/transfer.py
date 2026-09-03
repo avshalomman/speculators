@@ -19,7 +19,63 @@ from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStor
 
 if TYPE_CHECKING:
     import argparse
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+
+
+# Hidden-state files live in sub-directories of HS_SHARD_SIZE files each. An
+# object-store FUSE mount re-lists a directory whenever its directory cache
+# expires, one page of 1,000 keys per round trip, so every stat in a flat
+# directory costs O(N) in its size: generation into one such directory slowed
+# 43x over eleven hours as it filled to 113k files. Bounding directory size
+# bounds that cost for the writer and for the trainer, which stats one file per
+# sample. Files written before this layout existed sit flat at the root; they
+# are still found and still read.
+HS_SHARD_SIZE = 1000
+
+
+def hidden_states_file(root: Path, file_idx: int) -> Path:
+    """Where sample ``file_idx`` is written.
+
+    ``<root>/<idx // 1000>/hs_<idx>.safetensors``, zero-padded to four digits.
+    """
+    return root / f"{file_idx // HS_SHARD_SIZE:04d}" / f"hs_{file_idx}.safetensors"
+
+
+def hidden_states_candidates(root: Path, file_idx: int) -> tuple[Path, Path]:
+    """Where sample ``file_idx`` may be read from: sharded first, then the flat
+    path a run from before sharding used."""
+    return hidden_states_file(root, file_idx), root / f"hs_{file_idx}.safetensors"
+
+
+def _index_of(name: str) -> int | None:
+    if not (name.startswith("hs_") and name.endswith(".safetensors")):
+        return None
+    try:
+        return int(name[3:-12])
+    except ValueError:
+        return None
+
+
+def iter_hidden_state_indices(root: Path) -> Iterator[int]:
+    """Every sample index with a file under ``root``, flat or one directory down.
+
+    One listing per directory and no stat per file: on a FUSE mount a listing is
+    one request per 1,000 entries, and a stat can be a listing of its own.
+    """
+    if not root.is_dir():
+        return
+    with os.scandir(root) as top:
+        for entry in top:
+            if entry.is_file(follow_symlinks=False):
+                if (idx := _index_of(entry.name)) is not None:
+                    yield idx
+            elif entry.is_dir(follow_symlinks=False):
+                with os.scandir(entry.path) as shard:
+                    for inner in shard:
+                        if not inner.is_file(follow_symlinks=False):
+                            continue
+                        if (idx := _index_of(inner.name)) is not None:
+                            yield idx
 
 
 def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 0.1):
@@ -140,15 +196,18 @@ class FileTransfer(HiddenStatesTransfer):
         self.hidden_states_path = hidden_states_path
 
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
-        path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        return _load_hs_file(path)
+        for path in hidden_states_candidates(self.hidden_states_path, file_idx):
+            loaded = _load_hs_file(path)
+            if loaded is not None:
+                return loaded
+        return None
 
     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
         return _load_hs_file(Path(handle))
 
     def cache(self, handle: str, file_idx: int) -> None:
-        self.hidden_states_path.mkdir(parents=True, exist_ok=True)
-        target = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+        target = hidden_states_file(self.hidden_states_path, file_idx)
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(handle, target)
 
     def delete(self, handle: str) -> None:

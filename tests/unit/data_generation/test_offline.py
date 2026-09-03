@@ -98,6 +98,24 @@ class TestGetExistingHiddenStateIndices:
         result = get_existing_hidden_state_indices(tmp_path)
         assert result == [0]
 
+    def test_finds_files_in_sharded_subdirectories(self, tmp_path):
+        (tmp_path / "0000").mkdir()
+        (tmp_path / "0000" / "hs_5.safetensors").touch()
+        (tmp_path / "0113").mkdir()
+        (tmp_path / "0113" / "hs_113820.safetensors").touch()
+        result = get_existing_hidden_state_indices(tmp_path)
+        assert result == [5, 113820]
+
+    def test_flat_and_sharded_files_are_found_together_and_deduplicated(self, tmp_path):
+        # A run from before sharding leaves flat files; the resumed run shards.
+        (tmp_path / "hs_0.safetensors").touch()
+        (tmp_path / "hs_7.safetensors").touch()
+        (tmp_path / "0000").mkdir()
+        (tmp_path / "0000" / "hs_7.safetensors").touch()
+        (tmp_path / "0000" / "hs_8.safetensors").touch()
+        result = get_existing_hidden_state_indices(tmp_path)
+        assert result == [0, 7, 8]
+
     def test_ignores_unrelated_files(self, tmp_path):
         (tmp_path / "hs_0.safetensors").touch()
         (tmp_path / "other_file.txt").touch()

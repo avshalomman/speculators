@@ -27,6 +27,7 @@ from datasets import load_from_disk
 from safetensors.torch import load_file
 from tqdm import tqdm
 
+from hs_connectors import hidden_states_file
 from speculators.data_generation.offline import (
     check_hidden_states,
     get_existing_hidden_state_indices,
@@ -193,6 +194,11 @@ def parse_args():
     return parser.parse_args()
 
 
+def _move_into_shard(source: str, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(source, target)
+
+
 async def worker(  # noqa: C901
     client,
     model: str,
@@ -224,7 +230,7 @@ async def worker(  # noqa: C901
             queue.task_done()
             continue
 
-        target_hidden_states_path = hidden_states_output_dir / f"hs_{idx}.safetensors"
+        target_hidden_states_path = hidden_states_file(hidden_states_output_dir, idx)
 
         try:
             async with vllm_semaphore:  # Limit number of active generate calls
@@ -244,7 +250,7 @@ async def worker(  # noqa: C901
             async with write_semaphore:  # Limit number of active disk writes
                 t_write = time.perf_counter()
                 await asyncio.to_thread(
-                    shutil.move, hidden_states_path, target_hidden_states_path
+                    _move_into_shard, hidden_states_path, target_hidden_states_path
                 )
                 write_s = time.perf_counter() - t_write
                 if validate_outputs:

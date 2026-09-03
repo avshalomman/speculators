@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 
+from hs_connectors import iter_hidden_state_indices
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,23 +22,9 @@ def check_hidden_states(data: dict, tokens: list[int]):
 
 
 def get_existing_hidden_state_indices(output_path: Path) -> list[int]:
-    """Find existing `hs_i.safetensors` files (where i is the file index)"""
-
-    existing_file_indices_set: set[int] = set()
-
-    if not output_path.exists():
-        return []
-
-    for file_path in output_path.iterdir():
-        if file_path.name.startswith("hs_") and file_path.name.endswith(".safetensors"):
-            index_str = file_path.stem[3:]  # Remove "hs_" prefix
-            try:
-                file_index = int(index_str)
-                existing_file_indices_set.add(file_index)
-            except ValueError:
-                continue
-
-    return sorted(existing_file_indices_set)
+    """Find existing `hs_i.safetensors` files (where i is the file index), flat
+    at ``output_path`` or in its sharded sub-directories."""
+    return sorted(set(iter_hidden_state_indices(output_path)))
 
 
 def get_indices_to_process(

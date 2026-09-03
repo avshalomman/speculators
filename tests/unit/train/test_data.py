@@ -7,6 +7,7 @@ import torch
 from datasets import Dataset
 from safetensors.torch import save_file
 
+from hs_connectors import hidden_states_file
 from speculators.models.eagle3.data import shift_batch
 from speculators.train.data import (
     ArrowDataset,
@@ -258,7 +259,7 @@ def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Pat
     # Now the directory should exist
     assert arrow_ds.transfer.hidden_states_path.is_dir()
     # And the cached file should exist
-    assert (arrow_ds.transfer.hidden_states_path / "hs_0.safetensors").exists()
+    assert hidden_states_file(arrow_ds.transfer.hidden_states_path, 0).exists()
 
 
 MM_MESSAGES = [
