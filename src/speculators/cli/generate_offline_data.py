@@ -27,6 +27,7 @@ from datasets import load_from_disk
 from safetensors.torch import load_file
 from tqdm import tqdm
 
+from hs_connectors import hidden_states_file
 from speculators.data_generation.offline import (
     check_hidden_states,
     find_corrupt_hidden_state_indices,
@@ -120,6 +121,7 @@ def _publish_hidden_states(
     and the next run redoes the index, replacing any staged file left by a crash.
     Returns the seconds spent on the move.
     """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_name(f".{target_path.name}.tmp")
     try:
         t_move = time.perf_counter()
@@ -163,7 +165,7 @@ async def _worker(  # noqa: C901
             queue.task_done()
             continue
 
-        target_hidden_states_path = hidden_states_output_dir / f"hs_{idx}.safetensors"
+        target_hidden_states_path = hidden_states_file(hidden_states_output_dir, idx)
 
         try:
             async with vllm_semaphore:

@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 import torch
+from hs_connectors import hidden_states_candidates, iter_hidden_state_indices
 from safetensors import safe_open
 
 logger = logging.getLogger(__name__)
@@ -48,23 +49,9 @@ def check_hidden_states(data: dict, tokens: list[int]):
 
 
 def get_existing_hidden_state_indices(output_path: Path) -> list[int]:
-    """Find existing `hs_i.safetensors` files (where i is the file index)"""
-
-    existing_file_indices_set: set[int] = set()
-
-    if not output_path.exists():
-        return []
-
-    for file_path in output_path.iterdir():
-        if file_path.name.startswith("hs_") and file_path.name.endswith(".safetensors"):
-            index_str = file_path.stem[3:]  # Remove "hs_" prefix
-            try:
-                file_index = int(index_str)
-                existing_file_indices_set.add(file_index)
-            except ValueError:
-                continue
-
-    return sorted(existing_file_indices_set)
+    """Find existing `hs_i.safetensors` files (where i is the file index), flat
+    at ``output_path`` or in its sharded sub-directories."""
+    return sorted(set(iter_hidden_state_indices(output_path)))
 
 
 def find_corrupt_hidden_state_indices(
@@ -86,14 +73,15 @@ def find_corrupt_hidden_state_indices(
     """
     corrupt: dict[int, str] = {}
     for idx in indices:
-        path = output_path / f"hs_{idx}.safetensors"
-        try:
-            with safe_open(path, framework="pt"):
-                pass
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            corrupt[idx] = str(e) or type(e).__name__
+        for path in hidden_states_candidates(output_path, idx):
+            try:
+                with safe_open(path, framework="pt"):
+                    pass
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                corrupt[idx] = str(e) or type(e).__name__
+            break
     return corrupt
 
 

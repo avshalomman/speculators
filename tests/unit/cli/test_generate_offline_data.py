@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import torch
+from hs_connectors import hidden_states_file
 from hs_connectors.fp8_utils import SCALES_KEY, quantize_tensor_to_fp8
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
@@ -127,7 +128,8 @@ def test_validation_failure_does_not_publish(monkeypatch, tmp_path, output_dir, 
         {"idx": 0, "input_ids": [1, 2, 3]},
         {"idx": 1, "input_ids": [4, 5]},
     ]
-    previous = output_dir / "hs_1.safetensors"
+    previous = hidden_states_file(output_dir, 1)
+    previous.parent.mkdir(parents=True)
     save_file(_payload([4, 5]), previous)
     previous_bytes = previous.read_bytes()
 
@@ -145,7 +147,7 @@ def test_validation_failure_does_not_publish(monkeypatch, tmp_path, output_dir, 
     assert get_existing_hidden_state_indices(output_dir) == [1]
     assert previous.read_bytes() == previous_bytes
     # Nothing is left staged.
-    assert sorted(p.name for p in output_dir.iterdir()) == ["hs_1.safetensors"]
+    assert sorted(p.name for p in previous.parent.iterdir()) == ["hs_1.safetensors"]
 
 
 def test_valid_samples_are_published(monkeypatch, tmp_path, output_dir):
@@ -165,9 +167,9 @@ def test_valid_samples_are_published(monkeypatch, tmp_path, output_dir):
     assert stats["errors"] == 0
     assert stats["ok"] == 2
     assert skipped == []
-    assert _token_ids(output_dir / "hs_0.safetensors") == [1, 2, 3]
-    assert _token_ids(output_dir / "hs_1.safetensors") == [4, 5]
-    assert sorted(p.name for p in output_dir.iterdir()) == [
+    assert _token_ids(hidden_states_file(output_dir, 0)) == [1, 2, 3]
+    assert _token_ids(hidden_states_file(output_dir, 1)) == [4, 5]
+    assert sorted(p.name for p in (output_dir / "0000").iterdir()) == [
         "hs_0.safetensors",
         "hs_1.safetensors",
     ]
@@ -189,7 +191,7 @@ def test_publishes_without_validation_when_disabled(monkeypatch, tmp_path, outpu
     assert stats["errors"] == 0
     assert stats["ok"] == 1
     assert skipped == []
-    assert _token_ids(output_dir / "hs_0.safetensors") == [9, 9, 9]
+    assert _token_ids(hidden_states_file(output_dir, 0)) == [9, 9, 9]
 
 
 # ---------------------------------------------------------------------------
