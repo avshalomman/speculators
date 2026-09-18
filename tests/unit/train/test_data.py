@@ -1,7 +1,7 @@
 """Unit tests for data processing in speculators.train.data."""
 
-import logging
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -471,6 +471,8 @@ def test_collator_keeps_valid_samples_when_one_generation_fails():
     assert metadata.failure_count == 1
     assert collated["loss_mask"].sum() == 2
     assert torch.equal(collated["input_ids"][0, :2], torch.tensor([1, 2]))
+
+
 MM_MESSAGES = [
     {
         "role": "user",
