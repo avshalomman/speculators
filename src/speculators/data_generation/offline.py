@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 import torch
+
 from hs_connectors import iter_hidden_state_indices
 
 logger = logging.getLogger(__name__)
