@@ -34,6 +34,10 @@ def check_hidden_states(data: dict, tokens: list[int]):
     for start in range(0, hs.shape[0], rows_per_chunk):
         # Process hidden states in chunks to avoid OOMs
         chunk = hs[start : start + rows_per_chunk]
+        if chunk.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # torch implements neither isfinite nor isnan for float8; the fp8
+            # backend stores hidden states quantized, so check them upcast.
+            chunk = chunk.float()
         finite = torch.isfinite(chunk)
         if finite.all():
             continue
