@@ -16,6 +16,13 @@ from torch.nn.attention.flex_attention import (
 )
 from transformers.modeling_utils import AttentionInterface
 
+# Compiled once, lazily on first call. Inside a torch.compile'd model forward dynamo
+# inlines it, so the graph is unchanged. Inside a gradient-checkpointed layer, which
+# runs with dynamo disabled, the raw flex_attention falls back to the eager path that
+# materializes the [heads, Q, K] fp32 scores matrix: 232 GiB for a DSpark draft at
+# 3072 anchors x block 10 against a 32k context.
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+
 
 def flex_attention_forward(
     module: torch.nn.Module,  # noqa: ARG001
@@ -52,7 +59,7 @@ def flex_attention_forward(
     key = key.contiguous()
     value = value.contiguous()
 
-    flex_attention_output = flex_attention(
+    flex_attention_output = _compiled_flex_attention(
         query,
         key,
         value,
