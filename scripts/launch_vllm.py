@@ -271,6 +271,21 @@ def parse_args():
     )
     _add_shared_args(eval_parser)
 
+    # --- render subcommand ---
+    render_parser = sub.add_parser(
+        "render",
+        help=(
+            "Plain serving with the render throughput defaults and no "
+            "hidden-state extraction, for pipeline phases that only call /render"
+        ),
+    )
+    render_parser.add_argument(
+        "model",
+        type=str,
+        help="Model name or path to serve",
+    )
+    _add_shared_args(render_parser)
+
     subcommands = set(sub.choices)
     argv = sys.argv[1:]
     if not argv or (argv[0] not in subcommands and not argv[0].startswith("-")):
@@ -506,6 +521,25 @@ def _build_train_cmd(args, vllm_args):
     ]
 
 
+def _build_render_cmd(args, vllm_args):
+    """Serve the model for ``/render`` calls only, without hidden-state extraction.
+
+    The extraction connector adds a one-layer cache group whose block is a few
+    dozen tokens, and vLLM's shared block pool charges every block at the largest
+    group's size. On a hybrid verifier that is an order of magnitude more KV
+    memory per token than plain serving. Preparation and response regeneration
+    never read hidden states, so they can skip it and keep the full context window.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        args.model,
+        *_with_render_defaults(vllm_args),
+    ]
+
+
 def _build_eval_cmd(args, vllm_args):
     cmd = [
         sys.executable,
@@ -531,6 +565,8 @@ def main():
 
     if args.subcommand == "train":
         cmd = _build_train_cmd(args, vllm_args)
+    elif args.subcommand == "render":
+        cmd = _build_render_cmd(args, vllm_args)
     elif args.subcommand == "eval":
         cmd = _build_eval_cmd(args, vllm_args)
     else:
@@ -549,8 +585,8 @@ def main():
         )
 
     if not args.dry_run:
-        # Render tuning applies to the train pipeline only; eval serving skips it.
-        if args.subcommand == "train" and "--headless" not in vllm_args:
+        # Render tuning applies to the data pipeline only; eval serving skips it.
+        if args.subcommand in ("train", "render") and "--headless" not in vllm_args:
             _set_render_thread_defaults()
         os.execvp(cmd[0], cmd)  # noqa: S606
 

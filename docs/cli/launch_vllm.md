@@ -49,6 +49,19 @@ For non-headless launches, the script also defaults `OMP_NUM_THREADS`, `OPENBLAS
 
 The [training tutorial](../user_guide/tutorials/train.md) pins vLLM 0.27.1 for this path. These flags scale only the HTTP front end (chat-template application and tokenization); the engine and hidden-states connector are unaffected.
 
+## Render-only serving
+
+```bash
+python scripts/launch_vllm.py render <model> -- <vllm args>
+```
+
+Serves the model with the render throughput defaults above and **no hidden-state extraction**.
+Use it for the phases that only call `/render` (data preparation, response regeneration). The
+extraction connector adds a one-layer cache group with a block of a few dozen tokens, and vLLM's
+shared block pool charges every block at the largest group's size, so on a hybrid verifier the
+train-mode server needs an order of magnitude more KV memory per token than plain serving. A
+render-only server keeps the full context window without that cost.
+
 ## Full Example
 
 ```bash
