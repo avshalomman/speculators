@@ -92,24 +92,19 @@ def get_indices_to_process(
     if target <= 0:
         return []
 
-    chunk_size = target // world_size
-    remainder = target % world_size
-    # Distribute remainder across the first `remainder` ranks so chunks differ
-    # by at most 1.
-    start = rank * chunk_size + min(rank, remainder)
-    end = start + chunk_size + (1 if rank < remainder else 0)
-
+    # Strided, not contiguous: rows sit in dataset order, so contiguous ranges
+    # hand one rank every long trajectory and another the short single-turn
+    # rows, and the barrier waits on the slowest. Files are named by global
+    # index, so a resume skips what exists under either assignment.
     existing_s = set(existing)
-    to_process = [i for i in range(start, end) if i not in existing_s]
+    to_process = [i for i in range(rank, target, world_size) if i not in existing_s]
 
     if not to_process:
         logger.info("All samples for this rank already processed!")
         return []
 
-    if len(existing_s & set(range(start, end))) > 0:
-        logger.info(
-            f"Found {len(existing_s & set(range(start, end)))} existing samples"
-            f" for rank {rank}."
-        )
+    already = len(existing_s.intersection(range(rank, target, world_size)))
+    if already:
+        logger.info(f"Found {already} existing samples for rank {rank}.")
 
     return to_process

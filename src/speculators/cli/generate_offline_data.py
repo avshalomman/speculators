@@ -84,6 +84,7 @@ async def _worker(  # noqa: C901
     max_retries: int,
     fail_on_error: bool,
     skipped_indices: list[int],
+    rejected_indices: list[int],
     cancel_event: asyncio.Event,
     failure_tracker: _FailureTracker | None,
     stats: dict[str, Any],
@@ -141,6 +142,15 @@ async def _worker(  # noqa: C901
                 )
                 logging.shutdown()
                 os._exit(1)
+            if isinstance(e, openai.BadRequestError):
+                # The server refused this row -- over its context window, too
+                # many images -- not the request path. Expected on a corpus
+                # packed near the window, so it neither trips the consecutive-
+                # failure guard nor resets it.
+                logger.warning("Rejected sample %d: %s", idx, e)
+                rejected_indices.append(idx)
+                stats["rejected"] += 1
+                continue
             logger.warning("Skipping sample %d due to error: %s", idx, e)
             skipped_indices.append(idx)
             stats["errors"] += 1
@@ -164,7 +174,11 @@ async def _worker(  # noqa: C901
                 failure_tracker.record_success()
         finally:
             elapsed = time.perf_counter() - stats["start_time"]
-            postfix = {"ok": stats["ok"], "err": stats["errors"]}
+            postfix = {
+                "ok": stats["ok"],
+                "err": stats["errors"],
+                "rej": stats["rejected"],
+            }
             if elapsed > 0 and stats["ok"] > 0:
                 postfix["rps"] = f"{stats['ok'] / elapsed:.1f}"
                 postfix["vllm"] = f"{stats['total_vllm_s'] / stats['ok'] * 1000:.0f}ms"
@@ -255,10 +269,12 @@ async def _generate_and_save_hidden_states(
     write_semaphore = asyncio.Semaphore(concurrency)
 
     skipped_indices: list[int] = []
+    rejected_indices: list[int] = []
     cancel_event = asyncio.Event()
     stats: dict[str, Any] = {
         "ok": 0,
         "errors": 0,
+        "rejected": 0,
         "total_vllm_s": 0.0,
         "total_write_s": 0.0,
         "start_time": time.perf_counter(),
@@ -302,6 +318,7 @@ async def _generate_and_save_hidden_states(
                         max_retries,
                         fail_on_error,
                         skipped_indices,
+                        rejected_indices,
                         cancel_event,
                         failure_tracker,
                         stats,
@@ -324,8 +341,16 @@ async def _generate_and_save_hidden_states(
             stats["total_write_s"] / stats["ok"] * 1000,
         )
 
-    num_saved = len(to_process) - len(skipped_indices)
+    num_saved = len(to_process) - len(skipped_indices) - len(rejected_indices)
     logger.info(f"Saved {num_saved} new data points to {hidden_states_dir}")
+    if rejected_indices:
+        logger.warning(
+            "Rejected %d of %d samples by the server (over the context window "
+            "or the image limit); first indices: %s",
+            len(rejected_indices),
+            len(to_process),
+            sorted(rejected_indices)[:20],
+        )
     if skipped_indices:
         logger.warning(
             f"Skipped {len(skipped_indices)} samples due to errors: {skipped_indices}"

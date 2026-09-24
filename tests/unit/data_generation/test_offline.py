@@ -49,16 +49,16 @@ class TestGetIndicesToProcess:
     def test_multi_node_even_split(self):
         r0 = get_indices_to_process(10, None, [], world_size=2, rank=0)
         r1 = get_indices_to_process(10, None, [], world_size=2, rank=1)
-        assert r0 == [0, 1, 2, 3, 4]
-        assert r1 == [5, 6, 7, 8, 9]
+        assert r0 == [0, 2, 4, 6, 8]
+        assert r1 == [1, 3, 5, 7, 9]
 
     def test_multi_node_uneven_split(self):
         r0 = get_indices_to_process(10, None, [], world_size=3, rank=0)
         r1 = get_indices_to_process(10, None, [], world_size=3, rank=1)
         r2 = get_indices_to_process(10, None, [], world_size=3, rank=2)
-        assert r0 == [0, 1, 2, 3]
-        assert r1 == [4, 5, 6]
-        assert r2 == [7, 8, 9]
+        assert r0 == [0, 3, 6, 9]
+        assert r1 == [1, 4, 7]
+        assert r2 == [2, 5, 8]
 
     def test_multi_node_no_overlap_and_full_coverage(self):
         num_samples = 17
@@ -75,15 +75,21 @@ class TestGetIndicesToProcess:
     def test_multi_node_with_max_samples(self):
         r0 = get_indices_to_process(100, 10, [], world_size=2, rank=0)
         r1 = get_indices_to_process(100, 10, [], world_size=2, rank=1)
-        assert r0 == [0, 1, 2, 3, 4]
-        assert r1 == [5, 6, 7, 8, 9]
+        assert r0 == [0, 2, 4, 6, 8]
+        assert r1 == [1, 3, 5, 7, 9]
 
     def test_multi_node_with_existing(self):
-        result = get_indices_to_process(10, None, [1, 3], world_size=2, rank=0)
-        assert result == [0, 2, 4]
+        result = get_indices_to_process(10, None, [2, 6], world_size=2, rank=0)
+        assert result == [0, 4, 8]
+
+    def test_resume_from_a_contiguous_run_skips_what_exists(self):
+        # Files are named by global index, so rows a contiguous split wrote are
+        # skipped whichever rank now owns them.
+        result = get_indices_to_process(10, None, [0, 1, 2, 3, 4], world_size=2, rank=1)
+        assert result == [5, 7, 9]
 
     def test_multi_node_rank_fully_processed(self):
-        result = get_indices_to_process(10, None, [0, 1, 2, 3, 4], world_size=2, rank=0)
+        result = get_indices_to_process(10, None, [0, 2, 4, 6, 8], world_size=2, rank=0)
         assert result == []
 
     def test_existing_exceeds_num_samples(self):
