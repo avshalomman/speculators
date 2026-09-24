@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import logging
 import os
 import shutil
 import socket
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
+from safetensors import SafetensorError
 from safetensors.torch import load_file
 
 from hs_connectors.fp8_utils import SCALES_KEY, dequantize_fp8_tensor
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
 # sample. Files written before this layout existed sit flat at the root; they
 # are still found and still read.
 HS_SHARD_SIZE = 1000
+
+logger = logging.getLogger(__name__)
 
 
 def hidden_states_file(root: Path, file_idx: int) -> Path:
@@ -184,10 +188,16 @@ def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
     if Path(lock_path).exists():
         wait_for_lock(lock_path)
 
-    if file_path.exists():
+    if not file_path.exists():
+        return None
+    try:
         return load_file(file_path)
-
-    return None
+    except (SafetensorError, OSError) as exc:
+        # A writer killed mid-copy leaves a file whose header promises more
+        # bytes than it holds; read it as absent so the sample is skipped or
+        # regenerated instead of taking the run down.
+        logger.warning("Unreadable hidden-state file %s: %s", file_path, exc)
+        return None
 
 
 class FileTransfer(HiddenStatesTransfer):
@@ -209,7 +219,12 @@ class FileTransfer(HiddenStatesTransfer):
     def cache(self, handle: str, file_idx: int) -> None:
         target = hidden_states_file(self.hidden_states_path, file_idx)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(handle, target)
+        # Onto a FUSE mount the move is a copy, so land it under a name the
+        # index scan ignores and rename once complete: the final name never
+        # points at a partial file.
+        partial = target.with_name(target.name + ".tmp")
+        shutil.move(handle, partial)
+        os.replace(partial, target)
 
     def delete(self, handle: str) -> None:
         Path(handle).unlink()
