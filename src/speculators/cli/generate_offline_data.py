@@ -483,6 +483,10 @@ def generate_offline_data(
     if rank < 0 or rank >= world_size:
         raise typer.BadParameter("--rank must be in range [0, world_size)")
     setup_root_logger()
+    # Two lines per request at INFO ("HTTP Request: POST ... 200 OK"): 1.5M lines
+    # over a 400k-row run, and the log stream is the one channel that has
+    # broken mid-run and taken the node with it.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     logger.info("EAGLE Offline Data Generation")
 
