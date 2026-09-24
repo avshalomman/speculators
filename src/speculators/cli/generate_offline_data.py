@@ -117,7 +117,11 @@ async def _worker(  # noqa: C901
                 vllm_s = time.perf_counter() - t_vllm
             lock_path = hidden_states_path + ".lock"
             if Path(lock_path).exists():  # noqa: ASYNC240
-                await wait_for_lock_async(lock_path)
+                # The connector holds the lock until its writer has flushed
+                # the file, and that writer drains a backlog of every request
+                # in flight. The 10s default was sized for small rows; at
+                # 16k tokens x 6 layers the wait is the request's own budget.
+                await wait_for_lock_async(lock_path, timeout=request_timeout)
 
             async with write_semaphore:
                 t_write = time.perf_counter()

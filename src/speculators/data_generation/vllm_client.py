@@ -172,6 +172,13 @@ async def wait_for_lock_async(lock_path, timeout=10.0, poll_interval=0.1):
     fd = os.open(lock_path, os.O_RDWR)
     try:
         await asyncio.wait_for(_poll_lock_async(fd, poll_interval), timeout=timeout)
+    except TimeoutError:
+        # asyncio's TimeoutError carries no message; a bare "error:" in the
+        # generator log is what this looked like.
+        os.close(fd)
+        raise TimeoutError(
+            f"Timed out after {timeout}s waiting for lock: {lock_path}"
+        ) from None
     except BaseException:
         os.close(fd)
         raise
