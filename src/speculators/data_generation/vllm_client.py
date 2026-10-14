@@ -135,6 +135,11 @@ class ClientItem(TypedDict):
     """Tool definitions the conversation was tokenized with (see
     ``_chat_extra_body``)."""
 
+    keep_last: NotRequired[int]
+    """Store hidden states for only the last ``keep_last`` prompt tokens
+    (``kv_transfer_params`` of the hidden-states connector). Omitted: the
+    whole row."""
+
 
 def stringify_tool_call_arguments(messages: list[dict]) -> list[dict]:
     """Re-encode dict ``tool_calls[].function.arguments`` as the JSON strings
@@ -221,13 +226,26 @@ def _continue_final_message_for(model: str) -> bool:
     return any(marker in name for marker in _OPEN_FINAL_TURN_MODEL_MARKERS)
 
 
-def _chat_extra_body(model: str, tools: list[dict] | None) -> dict[str, Any]:
+def _kv_transfer_params(keep_last: int | None) -> dict[str, Any]:
+    """Connector parameters of a hidden-state request: the stored tail, if bounded."""
+    return {"kv_transfer_params": {"keep_last": keep_last}} if keep_last else {}
+
+
+def _completion_extra_body(keep_last: int | None) -> dict[str, Any]:
+    """Body fields for the Completions request of a stored prompt."""
+    return {"return_token_ids": True, **_kv_transfer_params(keep_last)}
+
+
+def _chat_extra_body(
+    model: str, tools: list[dict] | None, keep_last: int | None = None
+) -> dict[str, Any]:
     """Body fields for the Chat Completions re-render of a stored prompt."""
     extra_body: dict[str, Any] = {
         "add_generation_prompt": False,
         # Re-render to match the stored ``input_ids`` (model-dependent).
         "continue_final_message": _continue_final_message_for(model),
         "return_token_ids": True,
+        **_kv_transfer_params(keep_last),
     }
     if tools:
         # The chat template renders tools into the prompt, so the re-render
@@ -259,6 +277,7 @@ async def generate_hidden_states_async(
     """
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
+    keep_last = client_item.get("keep_last")
 
     coro: Coroutine[Any, Any, Completion | ChatCompletion]
     if messages is None:
@@ -266,7 +285,7 @@ async def generate_hidden_states_async(
             model=model,
             prompt=token_ids,
             max_tokens=1,
-            extra_body={"return_token_ids": True},
+            extra_body=_completion_extra_body(keep_last),
             timeout=timeout,
         )
     else:
@@ -274,7 +293,7 @@ async def generate_hidden_states_async(
             model=model,
             messages=messages,
             max_tokens=1,
-            extra_body=_chat_extra_body(model, client_item.get("tools")),
+            extra_body=_chat_extra_body(model, client_item.get("tools"), keep_last),
             timeout=timeout,
         )
 
@@ -301,6 +320,7 @@ def generate_hidden_states(
     """
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
+    keep_last = client_item.get("keep_last")
 
     res: Completion | ChatCompletion
     if messages is None:
@@ -308,7 +328,7 @@ def generate_hidden_states(
             model=model,
             prompt=token_ids,
             max_tokens=1,
-            extra_body={"return_token_ids": True},
+            extra_body=_completion_extra_body(keep_last),
             timeout=timeout,
         )
     else:
@@ -316,7 +336,7 @@ def generate_hidden_states(
             model=model,
             messages=messages,
             max_tokens=1,
-            extra_body=_chat_extra_body(model, client_item.get("tools")),
+            extra_body=_chat_extra_body(model, client_item.get("tools"), keep_last),
             timeout=timeout,
         )
 

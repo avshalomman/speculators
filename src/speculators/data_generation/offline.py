@@ -8,6 +8,21 @@ from hs_connectors import iter_hidden_state_indices
 logger = logging.getLogger(__name__)
 
 
+def hidden_state_offset(stored_token_ids: list[int], tokens: list[int]) -> int:
+    """Index in ``tokens`` where a stored row starts.
+
+    A row is stored whole (offset 0) or as its last N tokens when the request
+    asked the connector for ``keep_last`` (offset ``len(tokens) - N``).
+
+    Raises:
+        ValueError: The stored token ids are not ``tokens`` or a suffix of it.
+    """
+    offset = len(tokens) - len(stored_token_ids)
+    if offset < 0 or stored_token_ids != tokens[offset:]:
+        raise ValueError(f"Token ids don't match expected token ids {tokens}")
+    return offset
+
+
 def check_hidden_states(data: dict, tokens: list[int]):
     required = {"token_ids", "hidden_states"}
     missing = required - data.keys()
@@ -15,16 +30,15 @@ def check_hidden_states(data: dict, tokens: list[int]):
         raise ValueError(f"Hidden-state payload is missing keys: {missing}")
 
     t_ids = data["token_ids"].tolist()
-    if t_ids != tokens:
-        raise ValueError(f"Token ids don't match expected token ids {tokens}")
+    hidden_state_offset(t_ids, tokens)
 
     hs = data["hidden_states"]
     if not isinstance(hs, torch.Tensor):
         raise ValueError(f"Hidden states must be a tensor, got {type(hs).__name__}")
-    if len(tokens) != hs.shape[0]:
+    if len(t_ids) != hs.shape[0]:
         raise ValueError(
             f"Sequence length of hidden states {hs.shape[0]}"
-            f" doesn't match num tokens {len(tokens)}"
+            f" doesn't match num tokens {len(t_ids)}"
         )
 
     nan_count = 0

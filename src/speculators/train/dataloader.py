@@ -108,6 +108,7 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     max_train_batches: int | None = None,
+    keep_window: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -137,6 +138,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
+        keep_window=keep_window,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -153,6 +155,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
+        keep_window=keep_window,
     )
 
     train_loader = _setup_dataloader(

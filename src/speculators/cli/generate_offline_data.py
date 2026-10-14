@@ -194,14 +194,14 @@ async def _worker(  # noqa: C901
             queue.task_done()
 
 
-async def _feed_queue(to_process, dataset, queue, cancel_event):
+async def _feed_queue(to_process, dataset, queue, cancel_event, keep_window=None):
     """Feed dataset items into the worker queue, respecting cancellation."""
     for i in to_process:
         if cancel_event.is_set():
             break
 
         dataset_item = dataset[i]
-        client_item = build_client_item(dataset_item) | {"idx": i}
+        client_item = build_client_item(dataset_item, keep_window) | {"idx": i}
 
         while not cancel_event.is_set():
             try:
@@ -244,6 +244,7 @@ async def _generate_and_save_hidden_states(
     max_consecutive_errors: int | None,
     world_size: int,
     rank: int,
+    keep_window: int | None = None,
 ):
     dataset = load_from_disk(preprocessed_data)
 
@@ -331,7 +332,7 @@ async def _generate_and_save_hidden_states(
                 for _ in range(concurrency * 2)
             ]
 
-            await _feed_queue(to_process, dataset, queue, cancel_event)
+            await _feed_queue(to_process, dataset, queue, cancel_event, keep_window)
             await _shutdown_workers(workers, queue, cancel_event)
 
     elapsed = time.perf_counter() - stats["start_time"]
@@ -472,6 +473,16 @@ def generate_offline_data(
             ),
         ),
     ] = 0,
+    keep_window: Annotated[
+        int | None,
+        typer.Option(
+            help=(
+                "Store only each row's supervised tail plus this many context "
+                "tokens before it: the whole of what a draft with a sliding "
+                "window of this size reads. Default stores the whole row."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Generate hidden states offline from a vLLM server.
 
@@ -506,6 +517,7 @@ def generate_offline_data(
                 max_consecutive_errors=max_consecutive_errors,
                 world_size=world_size,
                 rank=rank,
+                keep_window=keep_window,
             )
         )
     except KeyboardInterrupt:

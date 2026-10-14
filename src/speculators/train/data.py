@@ -6,13 +6,18 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import numpy as np
 import openai
 import torch
+from datasets import Dataset as HFDataset
 from datasets import load_from_disk
 from torch.utils.data import Dataset
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
-from speculators.data_generation.offline import check_hidden_states
+from speculators.data_generation.offline import (
+    check_hidden_states,
+    hidden_state_offset,
+)
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -68,8 +73,13 @@ def _has_multimodal_content(messages: list[dict]) -> bool:
     return any(isinstance(m.get("content"), list) for m in messages)
 
 
-def build_client_item(dataset_item: dict) -> ClientItem:
+def build_client_item(dataset_item: dict, keep_window: int | None = None) -> ClientItem:
     """Build a request payload for vLLM hidden-state extraction.
+
+    With ``keep_window`` set, the request asks the connector to store only the
+    row's supervised tail plus that many context tokens before it, the whole
+    of what a draft with a sliding window of that size reads (see
+    :class:`hs_connectors.FP8HiddenStatesConnector`).
 
     When ``messages`` is included, ``generate_hidden_states`` uses the Chat
     Completions API and vLLM **re-tokenizes from the raw messages**, ignoring
@@ -106,7 +116,41 @@ def build_client_item(dataset_item: dict) -> ClientItem:
             if isinstance(tools_json, str) and tools_json:
                 out_dict["tools"] = json.loads(tools_json)
 
+    if keep_window is not None:
+        keep_last = _tail_length(dataset_item["loss_mask"], keep_window)
+        if keep_last is not None:
+            out_dict["keep_last"] = keep_last
+
     return cast("ClientItem", out_dict)
+
+
+def _tail_length(loss_mask: torch.Tensor, keep_window: int) -> int | None:
+    """Tokens from ``keep_window`` before the first supervised position to the
+    end; None when nothing is supervised."""
+    supervised = torch.nonzero(torch.as_tensor(loss_mask), as_tuple=False)
+    if supervised.numel() == 0:
+        return None
+    return int(loss_mask.shape[0] - supervised[0].item()) + keep_window
+
+
+def _tail_lengths(
+    data: HFDataset, keep_window: int, batch_size: int = 1024
+) -> list[int | None]:
+    """:func:`_tail_length` of every row, read column-wise from the Arrow data."""
+    tails: list[int | None] = []
+    for batch in data.with_format("arrow").iter(batch_size=batch_size):
+        masks = batch.column("loss_mask").combine_chunks()
+        offsets = masks.offsets.to_numpy()
+        flat = masks.values.to_numpy()
+        for row in range(len(masks)):
+            hits = np.flatnonzero(flat[offsets[row] : offsets[row + 1]])
+            if hits.size == 0:
+                tails.append(None)
+            else:
+                tails.append(
+                    int(offsets[row + 1] - offsets[row] - hits[0]) + keep_window
+                )
+    return tails
 
 
 class BaseDataset(Dataset):
@@ -193,8 +237,12 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
+        keep_window: int | None = None,
     ):
         self.data = load_from_disk(datapath)
+        # Context tokens kept before the supervised tail, when rows are trained as
+        # their tail only; None trains whole rows.
+        self.keep_window = keep_window
         if not 0.0 < train_ratio <= 1.0:
             raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
         if split == "val" and train_ratio == 1.0:
@@ -268,8 +316,15 @@ class ArrowDataset(BaseDataset):
         return len(self.data)
 
     def _compute_approx_lengths(self) -> list[int]:
-        """Get lengths of the dataset samples."""
-        return list(self.data.with_format(None)["seq_len"])
+        """Lengths the batch sampler packs by: the row, or its trained tail."""
+        seq_lens = list(self.data.with_format(None)["seq_len"])
+        if self.keep_window is None:
+            return seq_lens
+        tails = _tail_lengths(self.data, self.keep_window)
+        return [
+            min(n, t) if t is not None else n
+            for n, t in zip(seq_lens, tails, strict=True)
+        ]
 
     def _generate_hidden_states_once(
         self,
@@ -329,7 +384,7 @@ class ArrowDataset(BaseDataset):
         if cached_hs is None:
             if self.on_missing == "generate":
                 dataset_item = self.data[index]
-                client_item = build_client_item(dataset_item)
+                client_item = build_client_item(dataset_item, self.keep_window)
                 loaded_hs = self.generation_recovery.run(
                     lambda: self._generate_hidden_states_once(
                         index,
@@ -364,7 +419,15 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        # A row stored as its tail (connector ``keep_last``) starts at ``offset``.
+        # The connector keeps whole KV blocks, so the stored tail can run a few
+        # tokens past the requested one; trained rows are cut to exactly that
+        # tail, which is also what the batch sampler packed by.
+        try:
+            offset = hidden_state_offset(
+                loaded_hs["token_ids"].tolist(), self.data[index]["input_ids"].tolist()
+            )
+        except ValueError:
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
                 f"match input ids {self.data[index]['input_ids']}",
@@ -373,16 +436,23 @@ class ArrowDataset(BaseDataset):
             return SampleUnavailable(
                 reason=f"Cached token ids do not match sample {index}"
             )
+        start = 0
+        if self.keep_window is not None:
+            tail = _tail_length(self.data[index]["loss_mask"], self.keep_window)
+            stored = loaded_hs["token_ids"].shape[0]
+            if tail is not None and stored > tail:
+                start = stored - tail
+                offset += start
 
         return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+            "hidden_states": loaded_hs["hidden_states"][start:, :-1].flatten(
                 1
             ),  # [seq_len, 3 * hidden_size]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
+            "input_ids": loaded_hs["token_ids"][start:],  # [seq_len]
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
+                start:, -1
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": self.data[index]["loss_mask"][offset:],  # [seq_len]
         }
 
 

@@ -692,6 +692,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         vllm_endpoint=args.vllm_endpoint,
         on_missing=args.on_missing,
         on_generate=args.on_generate,
+        keep_window=args.hs_keep_window,
         verifier_name_or_path=args.verifier_name_or_path,
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,

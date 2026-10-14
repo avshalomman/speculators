@@ -270,6 +270,13 @@ class GenerationArgs(_Group):
         "Default 'generate' generates them on demand via the vLLM endpoint; the others "
         "skip the sample, skip with a warning, or raise.",
     )
+    hs_keep_window: int | None = Field(
+        default=None,
+        description="Train each row as its supervised tail plus this many context "
+        "tokens before it, and ask the hidden-states connector to store only that "
+        "tail (the whole of what a draft with a sliding window of this size reads). "
+        "Default trains whole rows.",
+    )
     on_generate: Literal["cache", "delete"] = Field(
         default="delete",
         description="Behaviour after generating a hidden state (only if "
