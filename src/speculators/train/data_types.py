@@ -8,6 +8,15 @@ from typing import Any
 import torch
 
 
+def tail_length(loss_mask: torch.Tensor, keep_window: int) -> int | None:
+    """Tokens from ``keep_window`` before the first supervised position to the
+    end; None when nothing is supervised."""
+    supervised = torch.nonzero(torch.as_tensor(loss_mask), as_tuple=False)
+    if supervised.numel() == 0:
+        return None
+    return int(loss_mask.shape[0] - supervised[0].item()) + keep_window
+
+
 @dataclass(frozen=True)
 class DatasetRecord:
     """A preprocessed dataset row together with its storage identity."""

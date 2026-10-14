@@ -77,6 +77,7 @@ def _run_worker(
     stats: dict[str, Any] = {
         "ok": 0,
         "errors": 0,
+        "rejected": 0,
         "total_vllm_s": 0.0,
         "total_write_s": 0.0,
         "start_time": time.perf_counter(),
@@ -102,6 +103,7 @@ def _run_worker(
                 max_retries=0,
                 fail_on_error=False,
                 skipped_indices=skipped_indices,
+                rejected_indices=[],
                 cancel_event=asyncio.Event(),
                 failure_tracker=None,
                 stats=stats,

@@ -272,6 +272,13 @@ class GenerationArgs(_Group):
         "selects vLLM generation; 'skip', 'warn', and 'raise' select the offline "
         "source and control what happens when a cached sample is missing.",
     )
+    hs_keep_window: int | None = Field(
+        default=None,
+        description="Train each row as its supervised tail plus this many context "
+        "tokens before it, and ask the hidden-states connector to store only that "
+        "tail (the whole of what a draft with a sliding window of this size reads). "
+        "Default trains whole rows.",
+    )
     on_generate: Literal["delete"] = Field(
         default="delete",
         description="Deprecated, no effect. Generated hidden states are always "

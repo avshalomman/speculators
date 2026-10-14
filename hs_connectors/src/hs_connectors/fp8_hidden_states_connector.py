@@ -17,6 +17,8 @@ tensors.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors.torch import save_file
@@ -25,6 +27,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 
 from hs_connectors.fp8_utils import SCALES_KEY, quantize_tensor_to_fp8
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
 
 
 class FP8HiddenStatesConnector(_eh_mod.ExampleHiddenStatesConnector):
@@ -35,7 +40,29 @@ class FP8HiddenStatesConnector(_eh_mod.ExampleHiddenStatesConnector):
         hidden_states        - fp8 [seq_len, num_layers, hidden_size]
         hidden_states_scales - fp32 [seq_len, 1, 1]
         token_ids            - int64 [seq_len]
+
+    A request may carry ``kv_transfer_params={"keep_last": N}``: the file then
+    holds only the last N prompt tokens, extended down to the start of the KV
+    block holding token ``T - N`` so it is never shorter than N. A draft with a
+    sliding window of W over the context reads nothing before ``W`` tokens
+    ahead of its first supervised position, so a row stored as its final turn
+    plus W context tokens trains it exactly as the full row would, at the
+    cost of the tail instead of the whole prompt.
     """
+
+    def request_finished(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        delay_free, params = super().request_finished(request, block_ids)
+        keep_last = (request.kv_transfer_params or {}).get("keep_last")
+        if keep_last:
+            req_id = request.request_id
+            self._pending_saves[req_id] = _trim_to_tail(
+                self._pending_saves[req_id], int(keep_last), self._block_size
+            )
+        return delay_free, params
 
     @staticmethod
     def _write_tensors(
@@ -57,3 +84,19 @@ class FP8HiddenStatesConnector(_eh_mod.ExampleHiddenStatesConnector):
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)
+
+
+def _trim_to_tail(
+    pending: _eh_mod.PendingSave, keep_last: int, block_size: int
+) -> _eh_mod.PendingSave:
+    """Keep the KV blocks and token ids from the block holding token
+    ``T - keep_last`` on."""
+    num_tokens = int(pending.token_ids.shape[0])
+    if keep_last >= num_tokens:
+        return pending
+    first_block = (num_tokens - keep_last) // block_size
+    return replace(
+        pending,
+        token_ids=pending.token_ids[first_block * block_size :],
+        block_ids=pending.block_ids[first_block:],
+    )

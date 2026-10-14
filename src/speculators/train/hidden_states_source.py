@@ -20,7 +20,11 @@ from speculators.data_generation.vllm_client import (
     has_multimodal_content,
     stringify_tool_call_arguments,
 )
-from speculators.train.data_types import DatasetRecord, GenerationReceipt
+from speculators.train.data_types import (
+    DatasetRecord,
+    GenerationReceipt,
+    tail_length,
+)
 from speculators.train.recovery import GenerationRecoveryGuard, SampleUnavailable
 
 logger = logging.getLogger("speculators")
@@ -43,12 +47,19 @@ class HiddenStatesSource(Protocol):
         """Release source resources."""
 
 
-def build_client_item(record: DatasetRecord) -> ClientItem:
+def build_client_item(
+    record: DatasetRecord, keep_window: int | None = None
+) -> ClientItem:
     """Build a vLLM request payload from a dataset record.
 
     Text-only records use their preprocessed token IDs. Multimodal records
     also forward their messages so vLLM can resolve image, video, or audio
     inputs through the Chat Completions API.
+
+    With ``keep_window`` set, the request asks the connector to store only the
+    row's supervised tail plus that many context tokens before it, the whole
+    of what a draft with a sliding window of that size reads (see
+    :class:`hs_connectors.FP8HiddenStatesConnector`).
     """
     out_dict: dict[str, Any] = {"input_ids": record.input_ids.tolist()}
 
@@ -58,6 +69,11 @@ def build_client_item(record: DatasetRecord) -> ClientItem:
         out_dict["messages"] = stringify_tool_call_arguments(record.messages)
         if record.tools:
             out_dict["tools"] = record.tools
+
+    if keep_window is not None:
+        keep_last = tail_length(record.loss_mask, keep_window)
+        if keep_last is not None:
+            out_dict["keep_last"] = keep_last
 
     return cast("ClientItem", out_dict)
 
@@ -122,6 +138,7 @@ class VllmHiddenStatesSource:
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
         max_transfer_workers: int = 4,
+        keep_window: int | None = None,
     ):
         if max_transfer_workers <= 0:
             raise ValueError("max_transfer_workers must be > 0")
@@ -132,6 +149,7 @@ class VllmHiddenStatesSource:
         self.request_timeout = request_timeout
         self.max_retries = max_retries
         self.max_transfer_workers = max_transfer_workers
+        self.keep_window = keep_window
         self.client: openai.AsyncOpenAI | None = None
         self._runner: asyncio.Runner | None = None
         self._transfer_executor: ThreadPoolExecutor | None = None
@@ -259,7 +277,7 @@ class VllmHiddenStatesSource:
             handle, transfer_params = await generate_hidden_states_async(
                 client,
                 self.model,
-                build_client_item(record),
+                build_client_item(record, self.keep_window),
                 timeout=self.request_timeout,
                 max_retries=self.max_retries,
             )

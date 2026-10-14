@@ -4,11 +4,14 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
+from datasets import Dataset as HFDataset
 from datasets import load_from_disk
 from torch.utils.data import Dataset
 
-from speculators.train.data_types import DatasetRecord
+from speculators.data_generation.offline import hidden_state_offset
+from speculators.train.data_types import DatasetRecord, tail_length
 from speculators.train.hidden_states_source import (
     HiddenStateSample,
     HiddenStatesSource,
@@ -59,6 +62,26 @@ def _strided_val_indices(n: int, train_ratio: float) -> list[int]:
     return [int((k + 0.5) * n / n_val) for k in range(n_val)]
 
 
+def _tail_lengths(
+    data: HFDataset, keep_window: int, batch_size: int = 1024
+) -> list[int | None]:
+    """:func:`tail_length` of every row, read column-wise from the Arrow data."""
+    tails: list[int | None] = []
+    for batch in data.with_format("arrow").iter(batch_size=batch_size):
+        masks = batch.column("loss_mask").combine_chunks()
+        offsets = masks.offsets.to_numpy()
+        flat = masks.values.to_numpy(zero_copy_only=False)
+        for row in range(len(masks)):
+            hits = np.flatnonzero(flat[offsets[row] : offsets[row + 1]])
+            if hits.size == 0:
+                tails.append(None)
+            else:
+                tails.append(
+                    int(offsets[row + 1] - offsets[row] - hits[0]) + keep_window
+                )
+    return tails
+
+
 class ArrowDataset(Dataset):
     """Load preprocessed Arrow rows and expose them as dataset records."""
 
@@ -67,8 +90,12 @@ class ArrowDataset(Dataset):
         datapath: str | PathLike,
         train_ratio: float = 1.0,
         split: Literal["train", "val"] = "train",
+        keep_window: int | None = None,
     ):
         self.datapath = Path(datapath)
+        # Context tokens kept before the supervised tail, when rows are trained as
+        # their tail only; None trains whole rows.
+        self.keep_window = keep_window
         self.data = load_from_disk(self.datapath)
         if not 0.0 < train_ratio <= 1.0:
             raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
@@ -96,12 +123,23 @@ class ArrowDataset(Dataset):
         # None when nothing is held out: the mapping is then the identity.
         self.storage_indices: list[int] | None = None if len(indices) == n else indices
         self.data = self.data.select(indices)
-        self.approx_lengths = list(self.data.with_format(None)["seq_len"])
+        self.approx_lengths = self._compute_approx_lengths()
 
     def _map_to_storage_index(self, index: int) -> int:
         if self.storage_indices is None:
             return index
         return self.storage_indices[index]
+
+    def _compute_approx_lengths(self) -> list[int]:
+        """Lengths the batch sampler packs by: the row, or its trained tail."""
+        seq_lens = list(self.data.with_format(None)["seq_len"])
+        if self.keep_window is None:
+            return seq_lens
+        tails = _tail_lengths(self.data, self.keep_window)
+        return [
+            min(n, t) if t is not None else n
+            for n, t in zip(seq_lens, tails, strict=True)
+        ]
 
     def __len__(self) -> int:
         return len(self.data)
@@ -164,7 +202,15 @@ class SpeculatorsDataset(Dataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], record.input_ids):
+        # A row stored as its tail (connector ``keep_last``) starts at ``offset``.
+        # The connector keeps whole KV blocks, so the stored tail can run a few
+        # tokens past the requested one; trained rows are cut to exactly that
+        # tail, which is also what the batch sampler packed by.
+        try:
+            offset = hidden_state_offset(
+                loaded_hs["token_ids"].tolist(), record.input_ids.tolist()
+            )
+        except ValueError:
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
                 f"match input ids {record.input_ids}",
@@ -187,21 +233,30 @@ class SpeculatorsDataset(Dataset):
         # verifier's final hidden state. Any other width keeps the original
         # behaviour of dropping the trailing entry, so no configuration that ran
         # before this change can start failing.
-        num_payload_layers = loaded_hs["hidden_states"].shape[1]
-        if num_payload_layers == self.num_target_layers:
-            hs_features = loaded_hs["hidden_states"]
-        else:
-            hs_features = loaded_hs["hidden_states"][:, :-1]
+        start = 0
+        keep_window = self.records.keep_window
+        if keep_window is not None:
+            tail = tail_length(record.loss_mask, keep_window)
+            stored = loaded_hs["token_ids"].shape[0]
+            if tail is not None and stored > tail:
+                start = stored - tail
+                offset += start
 
-        seq_len = loaded_hs["token_ids"].shape[0]
+        hidden_states = loaded_hs["hidden_states"][start:]
+        num_payload_layers = hidden_states.shape[1]
+        if num_payload_layers == self.num_target_layers:
+            hs_features = hidden_states
+        else:
+            hs_features = hidden_states[:, :-1]
+
+        input_ids = loaded_hs["token_ids"][start:]
+        seq_len = input_ids.shape[0]
 
         sample = {
             "hidden_states": hs_features.flatten(1),  # [seq_len, n_feat * h]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
-            "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
-            ],  # [seq_len, hidden_size]
-            "loss_mask": record.loss_mask,  # [seq_len]
+            "input_ids": input_ids,  # [seq_len]
+            "verifier_last_hidden_states": hidden_states[:, -1],  # [seq_len, h]
+            "loss_mask": record.loss_mask[offset:],  # [seq_len]
             "lengths": torch.tensor([seq_len], dtype=torch.long),
             "position_ids": torch.arange(seq_len, dtype=torch.long),
         }
