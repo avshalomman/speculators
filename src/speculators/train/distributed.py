@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -85,6 +86,14 @@ def get_dp_rank() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _process_group_timeout() -> timedelta:
+    """Collective timeout from ``SPECULATORS_PG_TIMEOUT_MIN`` (minutes; torch's
+    default of 10 when unset). A rank whose data fetch stalls longer than this
+    takes every rank down with it, so a slow or hanging storage mount wants a
+    longer window than torch's default."""
+    return timedelta(minutes=float(os.environ.get("SPECULATORS_PG_TIMEOUT_MIN", "10")))
+
+
 def _init_sp_process_groups(rank: int, world_size: int, sp_size: int) -> None:
     """Initialize sequence-parallel and data-parallel process groups.
 
@@ -106,14 +115,14 @@ def _init_sp_process_groups(rank: int, world_size: int, sp_size: int) -> None:
     sp_group = None
     for i in range(dp_size):
         sp_ranks = list(range(i * sp_size, (i + 1) * sp_size))
-        pg = dist.new_group(sp_ranks)
+        pg = dist.new_group(sp_ranks, timeout=_process_group_timeout())
         if rank in sp_ranks:
             sp_group = pg
 
     dp_group = None
     for i in range(sp_size):
         dp_ranks = list(range(i, world_size, sp_size))
-        pg = dist.new_group(dp_ranks)
+        pg = dist.new_group(dp_ranks, timeout=_process_group_timeout())
         if rank in dp_ranks:
             dp_group = pg
 
@@ -153,7 +162,9 @@ def maybe_setup_distributed(sp_size: int = 1) -> None:
     if acc is None:
         raise ValueError("No accelerator found")
     backend = torch.distributed.get_default_backend_for_device(acc)
-    dist.init_process_group(backend, device_id=local_rank)
+    dist.init_process_group(
+        backend, device_id=local_rank, timeout=_process_group_timeout()
+    )
 
     _rank = dist.get_rank()
     _world_size = dist.get_world_size()
