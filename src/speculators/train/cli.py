@@ -27,7 +27,7 @@ from speculators.models.utils import (
     resolve_draft_intermediate_size,
 )
 from speculators.train.config import TrainConfig
-from speculators.train.dataloader import create_train_val_loaders
+from speculators.train.dataloader import DataSource, create_train_val_loaders
 from speculators.train.distributed import (
     get_rank,
     is_distributed,
@@ -560,6 +560,29 @@ def build_draft_model(
     )
 
 
+def _parse_extra_data(
+    spec: str, args: argparse.Namespace, backend_cls
+) -> DataSource:
+    """Parse one ``--extra-data`` entry, 'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]'."""
+    name, sep, rest = spec.partition("=")
+    parts = rest.split(",")
+    if not sep or not name or len(parts) not in (2, 3) or not all(parts):
+        raise ValueError(
+            f"--extra-data {spec!r} is not "
+            "'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]'"
+        )
+    data_path, hidden_states_path = parts[:2]
+    source_args = argparse.Namespace(
+        **{**vars(args), "hidden_states_path": hidden_states_path}
+    )
+    return DataSource(
+        name=name,
+        data_path=data_path,
+        transfer=backend_cls.from_train_args(source_args, data_path),
+        keep_window=int(parts[2]) if len(parts) == 3 else None,
+    )
+
+
 def main(cfg: TrainConfig):  # noqa: C901
     # Phase-1 adapter: the model layer still consumes a flat vars(args)-shaped
     # dict via **kwargs, so flatten the typed config back into a namespace here.
@@ -682,8 +705,11 @@ def main(cfg: TrainConfig):  # noqa: C901
     # than the plugin depending on pydantic. test_backend_reconciliation.py keeps
     # the mirror complete so nothing read here was dropped during resolution.
     transfer = backend_cls.from_train_args(args, args.data_path)
+    extra_sources = [
+        _parse_extra_data(spec, args, backend_cls) for spec in args.extra_data or ()
+    ]
 
-    train_loader, val_loader = create_train_val_loaders(
+    train_loader, val_loader, extra_val_loaders = create_train_val_loaders(
         data_path=args.data_path,
         total_seq_len=args.total_seq_len,
         hidden_states_dtype=hidden_states_dtype,
@@ -704,6 +730,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        extra_sources=extra_sources,
     )
 
     # Get trainer kwargs from model class
@@ -736,7 +763,9 @@ def main(cfg: TrainConfig):  # noqa: C901
         gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
     )
-    trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+    trainer = Trainer(
+        draft_model, trainer_config, train_loader, val_loader, extra_val_loaders
+    )
 
     # Run training
     trainer.run_training()

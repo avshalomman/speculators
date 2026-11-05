@@ -83,6 +83,7 @@ def _make_val_trainer(n_batches: int, *, is_distributed: bool) -> "Trainer":
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
     trainer.val_loader = loader
+    trainer.extra_val_loaders = {}
     trainer.is_distributed = is_distributed
     trainer.rank = 1
     trainer.local_rank = 0

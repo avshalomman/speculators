@@ -205,6 +205,7 @@ class Trainer:
         config: TrainerConfig,
         train_loader: DataLoader,
         val_loader: DataLoader | None = None,
+        extra_val_loaders: dict[str, DataLoader] | None = None,
     ):
         self.model = model
         self.config = config
@@ -212,6 +213,9 @@ class Trainer:
         self.rank = get_rank()
         self.train_loader = train_loader
         self.val_loader = val_loader
+        # Validated after val_loader and logged as val_<name>; they do not pick the
+        # best checkpoint.
+        self.extra_val_loaders = extra_val_loaders or {}
         self.is_distributed = is_distributed()
         self.resume_from_checkpoint = config.resume_from_checkpoint
         acc = torch.accelerator.current_accelerator()
@@ -599,16 +603,31 @@ class Trainer:
         if batch_index > 0 and batch_index % _VAL_SYNC_INTERVAL == 0:
             dist.barrier()
 
-    @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
+        """Validate on ``val_loader``, then on each extra loader.
+
+        Returns the ``val_loader`` metrics, with each extra source's metrics added
+        under ``<name>/`` so they are saved alongside.
+        """
         if self.val_loader is None:
             return None
+        val_metrics = self._val_loader_epoch(self.val_loader, epoch, "val")
+        for name, loader in self.extra_val_loaders.items():
+            root_logger.info(f"Validation on {name} started")
+            extra = self._val_loader_epoch(loader, epoch, f"val_{name}")
+            val_metrics.update({f"{name}/{k}": v for k, v in extra.items()})
+        return val_metrics
+
+    @torch.no_grad()
+    def _val_loader_epoch(
+        self, loader: DataLoader, epoch: int, log_key: str
+    ) -> dict[str, float]:
         self.model.eval()
-        if hasattr(self.val_loader.batch_sampler, "set_epoch"):
-            self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
-        val_loader = self.val_loader
+        if hasattr(loader.batch_sampler, "set_epoch"):
+            loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
+        val_loader = loader
         if self.rank == 0:
-            val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            val_loader = tqdm(val_loader, desc=f"Epoch {epoch} {log_key}")  # type: ignore[assignment]
 
         accumulated: dict[str, torch.Tensor] = {}
         num_batches = len(val_loader)
@@ -649,7 +668,7 @@ class Trainer:
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
 
         metric_logger.info(
-            {"val": val_metrics, "epoch": epoch}, extra={"step": self.global_step}
+            {log_key: val_metrics, "epoch": epoch}, extra={"step": self.global_step}
         )
 
         return val_metrics

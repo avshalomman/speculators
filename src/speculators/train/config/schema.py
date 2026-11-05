@@ -224,6 +224,14 @@ class DataArgs(_Group):
         "Model master weights are always kept in fp32. Options: float32, bfloat16 "
         "(recommended). float16 is not supported (requires gradient scaling).",
     )
+    extra_data: list[str] | None = Field(
+        default=None,
+        description="More datasets trained together with --data-path, each "
+        "'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]' (KEEP_WINDOW as in "
+        "--hs-keep-window, which applies to --data-path only). Training rows of all "
+        "sources are shuffled and packed together; each source is split by "
+        "--train-data-ratio on its own and validated separately as val_NAME.",
+    )
     num_workers: int = Field(default=12, description="Number of dataloader workers.")
     prefetch_factor: int = Field(default=4, description="Dataloader prefetch factor.")
     max_anchors: int = Field(

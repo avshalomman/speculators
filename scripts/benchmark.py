@@ -302,7 +302,7 @@ def _build_train_loader(
     backend_cls = backend_registry[train_args.hidden_states_backend]
     transfer = backend_cls.from_train_args(train_args, train_args.data_path)
 
-    train_loader, _ = create_train_val_loaders(
+    train_loader, _, _ = create_train_val_loaders(
         data_path=train_args.data_path,
         total_seq_len=train_args.total_seq_len,
         hidden_states_dtype=hidden_states_dtype,
