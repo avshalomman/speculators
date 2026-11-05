@@ -166,6 +166,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             config.hidden_size,
             eps=config.rms_norm_eps,  # type: ignore[arg-type]
         )
+        # Residual dropout on the attention and MLP outputs; the attention kernel
+        # (flex attention) takes no dropout, so attention_dropout is not applied.
+        self.dropout = nn.Dropout(getattr(config, "hidden_dropout", 0.0))
 
     def forward(
         self,
@@ -200,8 +203,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
-        hidden_states = residual + hidden_states  # type: ignore[operator]
+        hidden_states = residual + self.dropout(hidden_states)  # type: ignore[operator]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states  # type: ignore[operator]
+        return residual + self.dropout(hidden_states)  # type: ignore[operator]

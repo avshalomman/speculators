@@ -2,7 +2,7 @@ import warnings
 from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
@@ -220,6 +220,15 @@ class SpeculatorsDataset(Dataset):
                 reason=f"Extracted token ids do not match sample {index}"
             )
 
+        start = 0
+        keep_window = self.records.keep_window
+        if keep_window is not None:
+            tail = tail_length(record.loss_mask, keep_window)
+            stored = loaded_hs["token_ids"].shape[0]
+            if tail is not None and stored > tail:
+                start = stored - tail
+                offset += start
+
         # The payload carries one entry per captured layer, ordered by layer id,
         # and its trailing entry is the verifier's final hidden state -- the input
         # of `verifier_lm_head`, i.e. the distilling target.
@@ -233,15 +242,6 @@ class SpeculatorsDataset(Dataset):
         # verifier's final hidden state. Any other width keeps the original
         # behaviour of dropping the trailing entry, so no configuration that ran
         # before this change can start failing.
-        start = 0
-        keep_window = self.records.keep_window
-        if keep_window is not None:
-            tail = tail_length(record.loss_mask, keep_window)
-            stored = loaded_hs["token_ids"].shape[0]
-            if tail is not None and stored > tail:
-                start = stored - tail
-                offset += start
-
         hidden_states = loaded_hs["hidden_states"][start:]
         num_payload_layers = hidden_states.shape[1]
         if num_payload_layers == self.num_target_layers:
@@ -265,15 +265,23 @@ class SpeculatorsDataset(Dataset):
 
     def __getitems__(self, indices: list[int]) -> BatchType:
         """Fetch and collate a DataLoader batch into its final representation."""
+        return self._collate(self._load_samples(indices))
+
+    def _load_samples(
+        self, indices: Sequence[int]
+    ) -> list[BatchType | SampleUnavailable]:
+        """Build the samples of ``indices``, in order, without collating them."""
         records = self.records.__getitems__(indices)
         loaded_hs = self.hidden_states.get_batch(records)
-        samples = [
+        return [
             self._build_sample(index, record, hidden_states)
             for index, record, hidden_states in zip(
                 indices, records, loaded_hs, strict=True
             )
         ]
 
+    def _collate(self, samples: list[BatchType | SampleUnavailable]) -> BatchType:
+        """Pad valid samples into one packed batch and record the unavailable ones."""
         unavailable: list[SampleUnavailable] = []
         valid_samples: list[BatchType] = []
         for item in samples:
@@ -311,6 +319,60 @@ class SpeculatorsDataset(Dataset):
     def close(self) -> None:
         """Close resources owned by the hidden-state source."""
         self.hidden_states.close()
+
+
+class MultiSourceDataset(SpeculatorsDataset):
+    """Several datasets behind one index, in order.
+
+    The batch sampler shuffles and packs over the combined index, so rows of all
+    sources are interleaved within a batch. Each row is read by its own dataset,
+    which keeps its own hidden-states source, keep window and storage mapping.
+    """
+
+    def __init__(self, datasets: Sequence[SpeculatorsDataset]):
+        first = datasets[0]
+        self.datasets = list(datasets)
+        self.offsets = np.cumsum([0] + [len(d) for d in datasets])
+        self.max_len = first.max_len
+        self.hidden_size = first.hidden_size
+        self.num_target_layers = first.num_target_layers
+        self.preprocess = first.preprocess
+        self.hidden_states_dtype = first.hidden_states_dtype
+        self.approx_lengths = [n for d in datasets for n in d.approx_lengths]
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        source = int(np.searchsorted(self.offsets, index, side="right")) - 1
+        return source, index - int(self.offsets[source])
+
+    def __getitem__(self, index: int) -> BatchType | SampleUnavailable:
+        source, local = self._locate(index)
+        return self.datasets[source][local]
+
+    def _load_samples(
+        self, indices: Sequence[int]
+    ) -> list[BatchType | SampleUnavailable]:
+        """Load each source's rows in one batch call, then restore index order."""
+        by_source: dict[int, list[tuple[int, int]]] = {}
+        for position, index in enumerate(indices):
+            source, local = self._locate(index)
+            by_source.setdefault(source, []).append((position, local))
+        samples: list[BatchType | SampleUnavailable | None] = [None] * len(indices)
+        for source, entries in by_source.items():
+            loaded = self.datasets[source]._load_samples([lo for _, lo in entries])  # noqa: SLF001
+            for (position, _), sample in zip(entries, loaded, strict=True):
+                samples[position] = sample
+        return cast("list[BatchType | SampleUnavailable]", samples)
+
+    def close(self) -> None:
+        """Close every source's hidden-state source once."""
+        closed: set[int] = set()
+        for dataset in self.datasets:
+            if id(dataset.hidden_states) not in closed:
+                closed.add(id(dataset.hidden_states))
+                dataset.close()
 
 
 def _pad_samples(batch: list[BatchType], max_len: int, dtype: torch.dtype) -> BatchType:

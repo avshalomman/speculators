@@ -4,9 +4,10 @@ import logging
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 import os
+from dataclasses import dataclass
 
 import torch
 from torch.utils.data import DataLoader
@@ -15,6 +16,7 @@ from hs_connectors import FileTransfer, HiddenStatesTransfer
 from speculators.data_generation.vllm_client import validate_vllm_model
 from speculators.train.data import (
     ArrowDataset,
+    MultiSourceDataset,
     SpeculatorsDataset,
 )
 from speculators.train.distributed import get_dp_rank, get_dp_size
@@ -30,6 +32,16 @@ from speculators.train.hidden_states_source import (
 logger = logging.getLogger(__name__)
 
 BatchType = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DataSource:
+    """A dataset trained alongside ``--data-path``, with its own hidden states."""
+
+    name: str
+    data_path: str
+    transfer: HiddenStatesTransfer | None
+    keep_window: int | None = None
 
 
 def _limit_worker_threads() -> None:
@@ -114,7 +126,8 @@ def create_train_val_loaders(
     seed: int = 0,
     max_transfer_workers: int = 1,
     keep_window: int | None = None,
-) -> tuple[DataLoader, DataLoader]:
+    extra_sources: Sequence[DataSource] = (),
+) -> tuple[DataLoader, DataLoader, dict[str, DataLoader]]:
     """Create training and validation DataLoaders.
 
     Non-data SP ranks get lightweight loaders with no workers (they receive
@@ -124,24 +137,28 @@ def create_train_val_loaders(
     ``seed`` sets the training packing order and must be the same on every
     rank. Validation keeps a fixed order, so runs with different seeds are
     validated on the same packed batches.
+
+    ``extra_sources`` are split like ``data_path`` (each by ``train_data_ratio``);
+    their training rows join one shuffled training set, and each gets its own
+    validation loader, returned by source name.
     """
     _limit_worker_threads()
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
 
-    train_records = ArrowDataset(
-        datapath=data_path,
-        train_ratio=train_data_ratio,
-        split="train",
-        keep_window=keep_window,
-    )
-    val_records = ArrowDataset(
-        datapath=data_path,
-        train_ratio=train_data_ratio,
-        split="val",
-        keep_window=keep_window,
-    )
+    primary = DataSource("primary", data_path, transfer, keep_window)
+
+    def make_records(source: DataSource, split: Literal["train", "val"]):
+        return ArrowDataset(
+            datapath=source.data_path,
+            train_ratio=train_data_ratio,
+            split=split,
+            keep_window=source.keep_window,
+        )
+
+    train_records = make_records(primary, "train")
+    val_records = make_records(primary, "val")
 
     # ``on_missing=generate`` is retained as the backwards-compatible switch
     # for the vLLM source. The other values select offline loading and define
@@ -149,6 +166,8 @@ def create_train_val_loaders(
     source_transfer = transfer or FileTransfer(train_records.datapath / "hidden_states")
     hidden_states_source: HiddenStatesSource
     if on_missing == "generate":
+        if extra_sources:
+            raise ValueError("--extra-data needs offline hidden states")
         validate_vllm_model(vllm_endpoint, verifier_name_or_path)
         hidden_states_source = VllmHiddenStatesSource(
             transfer=source_transfer,
@@ -167,24 +186,43 @@ def create_train_val_loaders(
             on_missing=on_missing,
         )
 
-    train_dataset = SpeculatorsDataset(
-        records=train_records,
-        max_len=total_seq_len,
-        hidden_states=hidden_states_source,
-        hidden_size=hidden_size,
-        hidden_states_dtype=hidden_states_dtype,
-        num_target_layers=num_target_layers,
-        preprocess=preprocess,
+    def make_dataset(records: ArrowDataset, source: HiddenStatesSource):
+        return SpeculatorsDataset(
+            records=records,
+            max_len=total_seq_len,
+            hidden_states=source,
+            hidden_size=hidden_size,
+            hidden_states_dtype=hidden_states_dtype,
+            num_target_layers=num_target_layers,
+            preprocess=preprocess,
+        )
+
+    def offline_source(source: DataSource) -> HiddenStatesSource:
+        records_path = make_records(source, "val").datapath
+        return OfflineHiddenStatesSource(
+            transfer=source.transfer or FileTransfer(records_path / "hidden_states"),
+            on_missing=on_missing,  # type: ignore[arg-type]
+        )
+
+    train_dataset: SpeculatorsDataset = make_dataset(
+        train_records, hidden_states_source
     )
-    val_dataset = SpeculatorsDataset(
-        records=val_records,
-        max_len=total_seq_len,
-        hidden_states=hidden_states_source,
-        hidden_size=hidden_size,
-        hidden_states_dtype=hidden_states_dtype,
-        num_target_layers=num_target_layers,
-        preprocess=preprocess,
-    )
+    val_dataset = make_dataset(val_records, hidden_states_source)
+    extra_val_datasets: dict[str, SpeculatorsDataset] = {}
+    if extra_sources:
+        extra_train = []
+        for source in extra_sources:
+            extra_hs = offline_source(source)
+            extra_train.append(make_dataset(make_records(source, "train"), extra_hs))
+            extra_val_datasets[source.name] = make_dataset(
+                make_records(source, "val"), extra_hs
+            )
+        train_dataset = MultiSourceDataset([train_dataset, *extra_train])
+        logger.info(
+            "Training on %s and %s, shuffled together",
+            data_path,
+            ", ".join(f"{s.name}={s.data_path}" for s in extra_sources),
+        )
 
     train_loader = _setup_dataloader(
         train_dataset,
@@ -200,5 +238,14 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
     )
+    extra_val_loaders = {
+        name: _setup_dataloader(
+            dataset,
+            total_seq_len,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        for name, dataset in extra_val_datasets.items()
+    }
 
-    return train_loader, val_loader
+    return train_loader, val_loader, extra_val_loaders
