@@ -119,8 +119,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         rotary_config = flatten_rope_parameters(config.transformer_layer_config)
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
+        # Optionally feed the verifier's token embeddings of the context tokens to
+        # fc as one more slice, ahead of the target-layer hidden states.
+        self.fc_token_embeddings = bool(getattr(tl_config, "fc_token_embeddings", False))
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
+            (len(self.target_layer_ids) + self.fc_token_embeddings)
+            * config.transformer_layer_config.hidden_size,
             config.transformer_layer_config.hidden_size,
             bias=False,
         )
@@ -415,7 +419,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
+        fc_input = hidden_states
+        if self.fc_token_embeddings:
+            fc_input = torch.cat(
+                [self.embed_tokens(input_ids).to(hidden_states.dtype), hidden_states],
+                dim=-1,
+            )
+        fc_output = self.fc(fc_input)
         fc_output = self.hidden_norm(fc_output)
         # shape: [1, total_seq_len, hidden_size]
 
