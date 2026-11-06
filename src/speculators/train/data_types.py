@@ -17,6 +17,7 @@ class DatasetRecord:
     seq_len: int
     storage_index: int
     messages: list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
 
     @classmethod
     def from_arrow_row(
@@ -31,12 +32,15 @@ class DatasetRecord:
         messages = row.get("messages")
         if isinstance(messages, str):
             messages = json.loads(messages)
+        tools_json = row.get("tools_json")
+        tools = json.loads(tools_json) if isinstance(tools_json, str) and tools_json else None
         return cls(
             input_ids=row["input_ids"],
             loss_mask=row["loss_mask"],
             seq_len=int(row["seq_len"]),
             storage_index=storage_index,
             messages=messages,
+            tools=tools,
         )
 
 

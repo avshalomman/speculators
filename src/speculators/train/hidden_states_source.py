@@ -18,6 +18,7 @@ from speculators.data_generation.vllm_client import (
     ClientItem,
     generate_hidden_states_async,
     has_multimodal_content,
+    stringify_tool_call_arguments,
 )
 from speculators.train.data_types import DatasetRecord, GenerationReceipt
 from speculators.train.recovery import GenerationRecoveryGuard, SampleUnavailable
@@ -52,7 +53,11 @@ def build_client_item(record: DatasetRecord) -> ClientItem:
     out_dict: dict[str, Any] = {"input_ids": record.input_ids.tolist()}
 
     if record.messages is not None and has_multimodal_content(record.messages):
-        out_dict["messages"] = record.messages
+        # Idempotent; datasets generated before arguments were stringified at
+        # store time still hold dicts.
+        out_dict["messages"] = stringify_tool_call_arguments(record.messages)
+        if record.tools:
+            out_dict["tools"] = record.tools
 
     return cast("ClientItem", out_dict)
 

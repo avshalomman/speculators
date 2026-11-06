@@ -406,6 +406,43 @@ def test_preprocess_keeps_conversation_specific_render_error_policy(
 class _ProcessorMixinStub(ProcessorMixin):
     """Routes preprocessing down the multimodal path; never called."""
 # --------------------------------------------------------------------------- #
+# _parse_conv_tools -- canonical tool key order                                 #
+# --------------------------------------------------------------------------- #
+class TestParseConvTools:
+    """Tools are canonicalized to the key order vLLM re-serializes them with,
+    so templates that ``tojson`` a tool render the same prompt on both sides."""
+
+    def test_reorders_tool_keys(self):
+        tools = [
+            {
+                "function": {"parameters": {}, "name": "click", "description": "d"},
+                "type": "function",
+            }
+        ]
+
+        parsed = preprocessing._parse_conv_tools(json.dumps(tools), 0)
+
+        assert parsed is not None
+        assert list(parsed[0]) == ["type", "function"]
+        assert list(parsed[0]["function"]) == ["name", "description", "parameters"]
+
+    def test_preserves_values_and_unknown_keys(self):
+        tools = [{"function": {"name": "click", "extra": 1}, "type": "function"}]
+
+        parsed = preprocessing._parse_conv_tools(tools, 0)
+
+        assert parsed == [
+            {"type": "function", "function": {"name": "click", "extra": 1}}
+        ]
+
+    def test_missing_and_invalid_tools(self):
+        assert preprocessing._parse_conv_tools(None, 0) is None
+        assert preprocessing._parse_conv_tools("", 0) is None
+        assert preprocessing._parse_conv_tools("{not json", 0) is None
+        assert preprocessing._parse_conv_tools(123, 0) is None
+
+
+# --------------------------------------------------------------------------- #
 # multiproc map -- Arrow schema alignment of the stored messages column        #
 # --------------------------------------------------------------------------- #
 class _FakeMMProcessor(ProcessorMixin):
@@ -550,12 +587,23 @@ def test_multiproc_heterogeneous_conversations(render_stub, tmp_path):
         },
         {"role": "assistant", "content": [{"type": "text", "text": "Blank."}]},
     ]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "click", "parameters": {"type": "object"}},
+        }
+    ]
     # Load through the json builder like prepare_data.py does: from_dict would
     # reject the heterogeneous conversations column outright.
     data_file = tmp_path / "convs.jsonl"
     with data_file.open("w") as f:
-        for conv in (text_conv, text_conv, mm_conv, mm_conv):
-            f.write(json.dumps({"conversations": conv}) + "\n")
+        for i, conv in enumerate((text_conv, text_conv, mm_conv, mm_conv)):
+            row: dict = {"conversations": conv}
+            # Only some rows carry tools, so the column is heterogeneous too.
+            # Stored structured, exactly as the dataset converters emit it.
+            if i == 3:
+                row["tools"] = tools
+            f.write(json.dumps(row) + "\n")
     dataset = load_dataset("json", data_files=str(data_file), split="train")
 
     result = build_speculator_training_dataset(
@@ -573,3 +621,66 @@ def test_multiproc_heterogeneous_conversations(render_stub, tmp_path):
         "type": "image_url",
         "image_url": {"url": f"file://{img_path}"},
     }
+    # Tools travel with the messages: the template renders them into the
+    # prompt, so the vLLM request must be able to send them back.
+    assert json.loads(result["tools_json"][3]) == tools
+    assert result["tools_json"][2] == ""
+
+
+@pytest.mark.sanity
+def test_multiproc_empty_shard_with_tools(render_stub, tmp_path):
+    """A shard that filters out all of its samples must not break alignment —
+    the reason the output column is `tools_json`, not `tools` (see
+    `_append_boundary_rows`)."""
+    # Heterogeneous parameter schemas, so `tools` infers a nested/Json type.
+    tools_a = [
+        {
+            "type": "function",
+            "function": {
+                "name": "click",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {"x": {"type": "int"}}},
+            },
+        }
+    ]
+    tools_b = [
+        {
+            "type": "function",
+            "function": {
+                "name": "type",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {"s": {"type": "str"}}},
+            },
+        }
+    ]
+
+    data_file = tmp_path / "convs.jsonl"
+    long_answer = " ".join(["alpha"] * 80)
+    with data_file.open("w") as f:
+        for i in range(8):
+            # The last four answers are one token, so minimum_valid_tokens
+            # drops them and the shards holding them emit zero rows.
+            row: dict = {
+                "conversations": [
+                    {"role": "user", "content": f"q{i}"},
+                    {"role": "assistant", "content": long_answer if i < 4 else "a"},
+                ]
+            }
+            if i in (0, 4):
+                row["tools"] = tools_a if i == 0 else tools_b
+            f.write(json.dumps(row) + "\n")
+    dataset = load_dataset("json", data_files=str(data_file), split="train")
+
+    result = build_speculator_training_dataset(
+        dataset,
+        _FakeMMProcessor(),
+        max_length=2048,
+        num_proc=4,
+        render_endpoint=render_stub,
+        minimum_valid_tokens=20,
+    )
+
+    assert len(result) == 4
+    assert "tools_json" in result.column_names
+    assert "tools" not in result.column_names
+    assert json.loads(result["tools_json"][0]) == tools_a

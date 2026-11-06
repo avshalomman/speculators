@@ -666,26 +666,104 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
 
 
-def test_dataset_record_decodes_json_serialized_messages():
-    """Messages stored as a JSON string decode to the structured conversation."""
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Describe this image."},
-                {"type": "image_url", "image_url": {"url": "file:///img.png"}},
-            ],
+
+MM_MESSAGES = [
+    {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "file:///i.png"}}],
+    },
+    {"role": "assistant", "content": "It is blank."},
+]
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": "Click at the given position.",
+            "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}},
         },
-        {"role": "assistant", "content": "It is blank."},
-    ]
+    }
+]
+
+
+def _client_item(messages, **extra):
     row = {
         "input_ids": torch.tensor([1, 2, 3]),
         "loss_mask": torch.tensor([0, 1, 1]),
         "seq_len": 3,
-        "messages": json.dumps(messages),
+        "messages": messages if extra.pop("structured", False) else json.dumps(messages),
+        **extra,
     }
+    return build_client_item(DatasetRecord.from_arrow_row(row, storage_index=0))
 
-    record = DatasetRecord.from_arrow_row(row, storage_index=0)
 
-    assert record.messages == messages
-    assert build_client_item(record)["messages"] == messages
+def test_build_client_item_decodes_json_serialized_messages():
+    """Multimodal messages stored as a JSON string are decoded and forwarded."""
+    client_item = _client_item(MM_MESSAGES)
+
+    assert client_item["input_ids"] == [1, 2, 3]
+    assert client_item["messages"] == MM_MESSAGES
+
+
+def test_build_client_item_omits_text_only_json_messages():
+    """Text-only conversations go through the Completions API."""
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi!"},
+    ]
+
+    assert "messages" not in _client_item(messages)
+
+
+def test_build_client_item_accepts_structured_messages():
+    """Datasets prepared before messages were JSON-serialized store structured
+    rows; they must keep working."""
+    assert _client_item(MM_MESSAGES, structured=True)["messages"] == MM_MESSAGES
+
+
+def test_build_client_item_stringifies_dict_tool_call_arguments():
+    """Datasets generated before arguments were stringified at store time hold
+    dicts; the request must still carry JSON strings."""
+    arguments = {"element": "Submit button", "x": 772, "y": 512}
+    messages = MM_MESSAGES + [
+        {
+            "role": "assistant",
+            "content": "Clicking.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "click_web", "arguments": arguments},
+                }
+            ],
+        },
+    ]
+
+    sent = _client_item(messages)["messages"]
+
+    sent_arguments = sent[-1]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(sent_arguments, str)
+    assert json.loads(sent_arguments) == arguments
+    assert sent[:-1] == messages[:-1]
+
+
+def test_build_client_item_forwards_tools():
+    """Tools travel with the messages so vLLM's re-render can reproduce
+    input_ids."""
+    assert _client_item(MM_MESSAGES, tools_json=json.dumps(TOOLS))["tools"] == TOOLS
+
+
+def test_build_client_item_omits_empty_tools():
+    """Conversations tokenized without tools keep the key out of the request."""
+    assert "tools" not in _client_item(MM_MESSAGES, tools_json="")
+
+
+def test_build_client_item_omits_tools_for_text_only_messages():
+    """Text-only conversations go through the Completions API, so neither
+    messages nor tools may be forwarded."""
+    client_item = _client_item(
+        [{"role": "user", "content": "Hi"}], tools_json=json.dumps(TOOLS)
+    )
+
+    assert "messages" not in client_item
+    assert "tools" not in client_item
