@@ -119,7 +119,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # Optionally feed the verifier's token embeddings of the context tokens to
         # fc as one more slice, ahead of the target-layer hidden states.
-        self.fc_token_embeddings = bool(getattr(tl_config, "fc_token_embeddings", False))
+        self.fc_token_embeddings = bool(
+            getattr(tl_config, "fc_token_embeddings", False)
+        )
         self.fc = nn.Linear(
             (len(self.target_layer_ids) + self.fc_token_embeddings)
             * config.transformer_layer_config.hidden_size,

@@ -666,7 +666,6 @@ def test_getitems_keeps_valid_samples_when_one_generation_fails(tmp_path):
     assert client.requests == [[1, 2, 3], [1, 2, 3]]
 
 
-
 MM_MESSAGES = [
     {
         "role": "user",
@@ -691,7 +690,9 @@ def _client_item(messages, **extra):
         "input_ids": torch.tensor([1, 2, 3]),
         "loss_mask": torch.tensor([0, 1, 1]),
         "seq_len": 3,
-        "messages": messages if extra.pop("structured", False) else json.dumps(messages),
+        "messages": messages
+        if extra.pop("structured", False)
+        else json.dumps(messages),
         **extra,
     }
     return build_client_item(DatasetRecord.from_arrow_row(row, storage_index=0))

@@ -2,8 +2,9 @@ import logging
 from pathlib import Path
 
 import torch
-from hs_connectors import hidden_states_candidates, iter_hidden_state_indices
 from safetensors import safe_open
+
+from hs_connectors import hidden_states_candidates, iter_hidden_state_indices
 
 logger = logging.getLogger(__name__)
 

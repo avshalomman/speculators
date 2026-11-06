@@ -14,11 +14,11 @@ from typing import Any
 
 import pytest
 import torch
-from hs_connectors import hidden_states_file
 from hs_connectors.fp8_utils import SCALES_KEY, quantize_tensor_to_fp8
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
+from hs_connectors import hidden_states_file
 from speculators.data_generation.offline import get_existing_hidden_state_indices
 
 # speculators.cli re-exports the command function under the module's own name,

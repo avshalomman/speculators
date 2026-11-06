@@ -18,8 +18,7 @@ import httpx
 import pytest
 import torch
 from datasets import Dataset as HFDataset
-from datasets import concatenate_datasets, load_from_disk
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset, load_from_disk
 from transformers import ProcessorMixin
 
 from speculators.data_generation import preprocessing, render_client
@@ -405,6 +404,8 @@ def test_preprocess_keeps_conversation_specific_render_error_policy(
 
 class _ProcessorMixinStub(ProcessorMixin):
     """Routes preprocessing down the multimodal path; never called."""
+
+
 # --------------------------------------------------------------------------- #
 # _parse_conv_tools -- canonical tool key order                                 #
 # --------------------------------------------------------------------------- #
@@ -526,6 +527,8 @@ def test_mixed_text_and_multimodal_sources_build_client_items(monkeypatch):
     text_item, mm_item = (build_client_item(record) for record in records)
     assert "messages" not in text_item
     assert mm_item["messages"] == records[1].messages
+
+
 def _stub_token_count(messages: list[dict], add_generation_prompt: bool) -> int:
     """Deterministic stand-in tokenization, monotonic in content length so a
     full render always extends its generation-prompt render."""

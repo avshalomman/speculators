@@ -635,13 +635,18 @@ def build_draft_model(
     )
 
 
-def _parse_extra_data(
-    spec: str, args: argparse.Namespace, backend_cls
-) -> DataSource:
-    """Parse one ``--extra-data`` entry, 'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]'."""
+_EXTRA_DATA_MAX_FIELDS = 3
+
+
+def _parse_extra_data(spec: str, args: argparse.Namespace, backend_cls) -> DataSource:
+    """Parse one ``--extra-data`` entry.
+
+    Format: 'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]'.
+    """
     name, sep, rest = spec.partition("=")
     parts = rest.split(",")
-    if not sep or not name or len(parts) not in (2, 3) or not all(parts):
+    well_formed = len(parts) in (2, _EXTRA_DATA_MAX_FIELDS) and all(parts)
+    if not sep or not name or not well_formed:
         raise ValueError(
             f"--extra-data {spec!r} is not "
             "'NAME=DATA_PATH,HIDDEN_STATES_PATH[,KEEP_WINDOW]'"
@@ -654,7 +659,7 @@ def _parse_extra_data(
         name=name,
         data_path=data_path,
         transfer=backend_cls.from_train_args(source_args, data_path),
-        keep_window=int(parts[2]) if len(parts) == 3 else None,
+        keep_window=int(parts[2]) if len(parts) == _EXTRA_DATA_MAX_FIELDS else None,
     )
 
 
