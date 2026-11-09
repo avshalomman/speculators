@@ -325,6 +325,7 @@ def _validate_draft_init(cfg: TrainConfig, provided: set[str]) -> None:
     passed at its default value still counts as a conflict -- preserving the
     pre-refactor behavior.
     """
+    _validate_trunk_init(cfg)
     shaping = [flag for dest, flag in DECODER_SHAPING_FLAGS.items() if dest in provided]
     with_draft_config = shaping + (["--draft-config"] if cfg.draft.draft_config else [])
     if cfg.draft.from_pretrained:
@@ -345,6 +346,28 @@ def _validate_draft_init(cfg: TrainConfig, provided: set[str]) -> None:
         _reject_conflicts(
             shaping,
             "--draft-config defines the draft decoder, so these flags conflict with it",
+        )
+
+
+def _validate_trunk_init(cfg: TrainConfig) -> None:
+    """``--init-trunk-from`` builds a fresh DSpark draft and loads only its trunk."""
+    if cfg.draft.freeze_trunk and not cfg.draft.init_trunk_from:
+        raise ConfigError(
+            "--freeze-trunk needs --init-trunk-from: it would freeze a random trunk"
+        )
+    if not cfg.draft.init_trunk_from:
+        return
+    if cfg.speculator_type != "dspark":
+        raise ConfigError("--init-trunk-from supports --speculator-type dspark only")
+    if cfg.draft.from_pretrained:
+        raise ConfigError(
+            "--init-trunk-from and --from-pretrained both initialize the draft; "
+            "pass one"
+        )
+    if not cfg.draft.draft_config:
+        raise ConfigError(
+            "--init-trunk-from needs --draft-config with the trained head's "
+            "decoder shape"
         )
 
 

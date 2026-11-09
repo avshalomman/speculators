@@ -81,6 +81,19 @@ class DraftArgs(_Group):
         "(--num-layers, --draft-arch, --draft-hidden-act, --sliding-window, "
         "--full-attention-indices).",
     )
+    init_trunk_from: str = Field(
+        default="",
+        description="Directory of a trained DSpark head whose trunk (fc, hidden_norm, "
+        "decoder layers, norm) initializes the draft built from --draft-config. Its "
+        "Markov, corrector and confidence heads are dropped, so the draft may swap "
+        "the Markov head for a corrector. The draft shape, block size, aux layers, "
+        "mask token and in-block causality must match the head's.",
+    )
+    freeze_trunk: bool = Field(
+        default=False,
+        description="Train only the Markov head, corrector and confidence head; the "
+        "trunk keeps the weights loaded by --init-trunk-from, which it requires.",
+    )
     draft_config: str = Field(
         default="",
         description="HF id, directory, or JSON path of a decoder config (LlamaConfig "

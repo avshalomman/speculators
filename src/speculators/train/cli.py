@@ -40,6 +40,7 @@ from speculators.train.logger import (
     setup_root_logger,
 )
 from speculators.train.trainer import Trainer, TrainerConfig
+from speculators.train.trunk_init import freeze_trunk, load_trunk
 from speculators.train.utils import resolve_mask_token_id
 from speculators.train.vocab_mapping import (
     build_vocab_mappings_from_distribution,
@@ -739,6 +740,10 @@ def main(cfg: TrainConfig):  # noqa: C901
     model_class = registry[args.speculator_type]
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
+    if args.init_trunk_from:
+        load_trunk(draft_model, args.init_trunk_from)
+    if args.freeze_trunk:
+        freeze_trunk(draft_model)
 
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
