@@ -392,9 +392,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        return_logits: bool = True,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
+
+        With ``return_logits=False`` the returned logits are ``None``: a subclass
+        that changes the hidden state before the output head skips the
+        vocabulary-wide matmul here.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
         anchored_block_indices)``. DSpark reuses this and adds its Markov and
@@ -482,7 +487,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
+        logits = self.lm_head(hidden) if return_logits else None
         # shape: [1, num_anchors*block_size, vocab_size]
 
         # The mask must gate the token a slot predicts, not the slot's own

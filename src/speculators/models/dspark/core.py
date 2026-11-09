@@ -13,8 +13,12 @@ from speculators.losses import (
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
-from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.metrics import compute_metrics, compute_rescore_metrics
+from speculators.models.dspark.model_definitions import (
+    ConfidenceHead,
+    MarkovHead,
+    RecurrentCorrector,
+)
 from speculators.models.utils import conditional_torch_compile
 
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
@@ -50,6 +54,26 @@ class DSparkDraftModel(DFlashDraftModel):
                 head_type=config.markov_head_type,
             )
 
+        self.corrector: RecurrentCorrector | None = None
+        if config.corrector_hidden_size > 0:
+            if self.markov_head is not None:
+                raise ValueError(
+                    "corrector_hidden_size > 0 replaces the Markov head; set "
+                    "markov_rank=0."
+                )
+            if config.enable_confidence_head and config.confidence_head_with_markov:
+                raise ValueError(
+                    "corrector_hidden_size > 0 needs "
+                    "confidence_head_with_markov=False; the confidence head reads "
+                    "the corrected hidden state instead."
+                )
+            self.corrector = RecurrentCorrector(
+                hidden_size=hidden_size,
+                state_size=config.corrector_hidden_size,
+                intermediate_size=config.corrector_intermediate_size,
+                eps=config.transformer_layer_config.rms_norm_eps,
+            )
+
         self.confidence_head: ConfidenceHead | None = None
         if config.enable_confidence_head:
             if config.confidence_head_with_markov and self.markov_head is None:
@@ -76,6 +100,10 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            corrector_hidden_size=kwargs.get("corrector_hidden_size", 0) or 0,
+            corrector_intermediate_size=kwargs.get("corrector_intermediate_size")
+            or 8192,
+            corrector_rescore_top_k=kwargs.get("corrector_rescore_top_k") or 256,
             enable_confidence_head=(
                 True
                 if enable_confidence_head_arg is None
@@ -144,6 +172,10 @@ class DSparkDraftModel(DFlashDraftModel):
                 document_ids,
                 position_ids,
                 max_anchors=max_anchors,
+                # The corrector recomputes the logits from the corrected hidden
+                # state; the trunk's own logits are needed only for the
+                # validation rescoring metrics.
+                return_logits=self.corrector is None or not self.training,
                 **kwargs,
             )
         )
@@ -170,6 +202,26 @@ class DSparkDraftModel(DFlashDraftModel):
 
         confidence_logits = None
         prev_emb = None
+        rescore_metrics: dict = {}
+        if self.corrector is not None:
+            delta = self.corrector(
+                hidden_blocks, self.embed_tokens(prev_token_ids.long())
+            )
+            hidden_blocks = hidden_blocks + delta.to(hidden_blocks.dtype)
+            base_logits = logits
+            logits = self.lm_head(hidden_blocks.view(1, mask_tokens_size, -1))
+            if base_logits is not None:
+                with torch.no_grad():
+                    rescore_metrics = compute_rescore_metrics(
+                        base_logits,
+                        logits,
+                        targets,
+                        aligned_loss_mask,
+                        self.block_size,
+                        top_ks=sorted({16, 64, self.config.corrector_rescore_top_k}),
+                        sample_from_anchor=self.config.sample_from_anchor,
+                    )
+                del base_logits
         if self.markov_head is not None:
             prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
             markov_bias = self.markov_head.block_bias(
@@ -209,4 +261,5 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
+        metrics.update(rescore_metrics)
         return None, loss, metrics

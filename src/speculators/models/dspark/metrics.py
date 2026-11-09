@@ -32,6 +32,7 @@ from speculators.models.metrics import (
 
 __all__ = [
     "compute_metrics",
+    "compute_rescore_metrics",
 ]
 
 _EPS = 1e-8
@@ -182,3 +183,75 @@ def compute_metrics(
     metrics["eal_total"] = eal_total
 
     return loss, metrics
+
+
+def compute_rescore_metrics(
+    base_logits: torch.Tensor,  # [1, T, V] trunk logits, lm_head(g)
+    corrected_logits: torch.Tensor,  # [1, T, V] lm_head(g + delta)
+    targets: torch.Tensor,  # [1, T, V]
+    loss_mask: torch.Tensor,  # [1, T]
+    block_size: int,
+    top_ks: list[int],
+    sample_from_anchor: bool = True,
+    chunk: int = 2048,
+) -> dict[str, torch.Tensor]:
+    """Greedy acceptance when the corrector only rescores the trunk's top-K.
+
+    Serving scores the top-K candidates of ``lm_head(g)`` with the corrected
+    logits and takes the best of them; since ``lm_head`` is linear, the
+    corrected logits gathered at those candidates are exactly those scores.
+    Reports, per K, the greedy accepted length (``rescore{K}_eal``) and how
+    often the full-vocabulary argmax of the corrected logits is among the
+    candidates (``rescore{K}_recall``), plus the trunk's own accepted length
+    without the corrector (``base_eal``).
+    """
+    seq_len = base_logits.shape[1]
+    num_blocks = seq_len // block_size
+    start_pos = 0 if sample_from_anchor else 1
+    valid = loss_mask.bool().view(num_blocks, block_size)[:, start_pos:]
+    max_k = min(max(top_ks), base_logits.shape[-1])
+    target_ids = torch.empty(seq_len, dtype=torch.long, device=base_logits.device)
+    full_ids = torch.empty_like(target_ids)
+    base_ids = torch.empty_like(target_ids)
+    picks = {k: torch.empty_like(target_ids) for k in top_ks}
+    hits = {
+        k: torch.empty(seq_len, dtype=torch.bool, device=base_logits.device)
+        for k in top_ks
+    }
+    for start in range(0, seq_len, chunk):
+        end = min(start + chunk, seq_len)
+        base = base_logits[0, start:end]
+        corrected = corrected_logits[0, start:end]
+        target_ids[start:end] = targets[0, start:end].argmax(-1)
+        full_ids[start:end] = corrected.argmax(-1)
+        base_ids[start:end] = base.argmax(-1)
+        candidates = base.topk(max_k, dim=-1).indices  # sorted by base logit
+        scores = corrected.gather(-1, candidates)
+        for k in top_ks:
+            kk = min(k, max_k)
+            best = scores[:, :kk].argmax(-1, keepdim=True)
+            picks[k][start:end] = candidates[:, :kk].gather(-1, best).squeeze(-1)
+            hits[k][start:end] = (candidates[:, :kk] == full_ids[start:end, None]).any(
+                -1
+            )
+
+    def blocks(x: torch.Tensor) -> torch.Tensor:
+        return x.view(num_blocks, block_size)[:, start_pos:]
+
+    metrics: dict[str, torch.Tensor] = {}
+    eal_sum, eal_total = compute_accepted_length_counts(
+        blocks(base_ids == target_ids), valid
+    )
+    metrics["base_eal_sum"], metrics["base_eal_total"] = eal_sum, eal_total
+    valid_total = valid.sum().to(torch.float32).clamp_min(1.0)
+    for k in top_ks:
+        eal_sum, eal_total = compute_accepted_length_counts(
+            blocks(picks[k] == target_ids), valid
+        )
+        metrics[f"rescore{k}_eal_sum"] = eal_sum
+        metrics[f"rescore{k}_eal_total"] = eal_total
+        metrics[f"rescore{k}_recall_sum"] = (
+            (blocks(hits[k]) & valid).sum().to(torch.float32)
+        )
+        metrics[f"rescore{k}_recall_total"] = valid_total.clone()
+    return metrics

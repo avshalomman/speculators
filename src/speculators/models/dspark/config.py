@@ -65,3 +65,28 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    # Recurrent hidden-space corrector (replaces the Markov head when enabled).
+    corrector_hidden_size: int = Field(
+        default=0,
+        description=(
+            "State width of the recurrent corrector; 0 disables it. Slot k's state "
+            "is computed from the previous slot's state, the verifier embedding of "
+            "the previous token and the trunk's hidden state g_k, and its output "
+            "delta_k corrects the hidden state: logits = lm_head(g_k + delta_k). "
+            "Requires markov_rank=0 and confidence_head_with_markov=False."
+        ),
+    )
+    corrector_intermediate_size: int = Field(
+        default=8192,
+        description="Width of the corrector's SwiGLU MLP.",
+    )
+    corrector_rescore_top_k: int = Field(
+        default=256,
+        description=(
+            "Candidates per slot the corrector rescores at serving time: the top-K "
+            "of lm_head(g_k), each scored as lm_head(g_k)[c] + W_lm[c] . delta_k. "
+            "Training uses full-vocabulary logits; validation reports rescored "
+            "accuracy at this K and at 16 and 64."
+        ),
+    )

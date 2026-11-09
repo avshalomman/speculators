@@ -576,6 +576,20 @@ class DSparkArgs(_Group):
     confidence_head_alpha: float = Field(
         default=1.0, description="DSpark: weight of the confidence-head BCE term."
     )
+    corrector_hidden_size: int = Field(
+        default=0,
+        description="DSpark: state width of the recurrent hidden-space corrector "
+        "(0 disables it). Replaces the Markov head: needs --markov-rank 0 and "
+        "--no-confidence-head-with-markov.",
+    )
+    corrector_intermediate_size: int = Field(
+        default=8192, description="DSpark: width of the corrector's SwiGLU MLP."
+    )
+    corrector_rescore_top_k: int = Field(
+        default=256,
+        description="DSpark: top-K trunk candidates the corrector rescores when "
+        "served; validation reports rescored acceptance at this K, 16 and 64.",
+    )
 
 
 class XPressArgs(_Group):
