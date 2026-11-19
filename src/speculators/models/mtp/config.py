@@ -52,6 +52,16 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    attention_window: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Tokens the MTP attention sees, the query token included; None "
+            "attends to the whole prefix. `speculators stitch` writes it into "
+            "the verifier config as `mtp_sliding_window` for vLLM."
+        ),
+    )
+
     @property
     def hidden_size(self) -> int:
         return self.transformer_layer_config.hidden_size  # type: ignore[return-value]

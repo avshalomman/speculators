@@ -1,12 +1,16 @@
 """MTP speculator model implementation."""
 
+import copy
 import logging
 from typing import Any, ClassVar
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
 from speculators import SpeculatorModel
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -93,16 +97,24 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
     from_pretrained), and excluded from saved checkpoints.
     verifier_lm_head is created by DraftVocabMixin but not used in
     the MTP forward pass.
+
+    The offline cache stores the verifier's last hidden state before its final
+    norm, while vLLM feeds MTP step 0 the normed output, so step 0 applies the
+    frozen ``verifier_norm`` (loaded from the verifier, never saved). With
+    ``config.attention_window`` set, the MTP attention sees only that many
+    tokens, as vLLM does when the stitched config carries ``mtp_sliding_window``.
     """
 
     config_class: ClassVar[type[MTPSpeculatorConfig]] = MTPSpeculatorConfig  # type: ignore[misc]
     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
         "embed_tokens.weight",
         "lm_head.weight",
+        "verifier_norm.weight",
     ]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "lm_head.weight",
+        "verifier_norm.weight",
         "verifier_lm_head.weight",
         "t2d",
         "d2t",
@@ -130,6 +142,15 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         self.rotary_emb = self._model_definitions.rotary_emb_class(
             flatten_rope_parameters(tc)
         )
+        # The verifier's final norm is the same class as its decoder norms, so it
+        # keeps the verifier's gain convention (x * (1 + w) on Qwen3.5).
+        self.verifier_norm = type(self.mtp_layers[0].final_layernorm)(
+            tc.hidden_size, eps=tc.rms_norm_eps
+        )
+        self._mask_config = tc
+        if config.attention_window is not None:
+            self._mask_config = copy.copy(tc)
+            self._mask_config.sliding_window = config.attention_window
 
         self.post_init()
 
@@ -150,8 +171,14 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         with torch.no_grad():
             self.embed_tokens.weight.fill_(torch.nan)
             self.lm_head.weight.fill_(torch.nan)
+            self.verifier_norm.weight.fill_(torch.nan)
         super().load_verifier_weights()
         del self.verifier_lm_head
+        if self.verifier_norm.weight.isnan().any():
+            raise ValueError(
+                "The verifier's final norm (model.norm.weight) was not found, so "
+                "MTP step 0 cannot see the normed hidden state that vLLM feeds it."
+            )
 
     # requires `dynamic=False`. See #876
     @conditional_torch_compile(dynamic=False)
@@ -227,15 +254,11 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             valid_len,
             self.config.transformer_layer_config.model_type,
         )
-        causal_mask = create_causal_mask(
-            config=self.config.transformer_layer_config,
-            inputs_embeds=hidden_states[:, :valid_len],
-            attention_mask=attention_mask,
-            past_key_values=None,
-            position_ids=step_pos_ids,
+        causal_mask = self._attention_mask(
+            hidden_states[:, :valid_len], attention_mask, step_pos_ids
         )
 
-        current_hidden = hidden_states
+        current_hidden = self.verifier_norm(hidden_states)
         for step in range(effective_steps):
             step_hidden = current_hidden[:, :valid_len]
             step_embeds = self.embed_tokens(
@@ -278,6 +301,29 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return (all_logits, total_loss, metrics)
 
+    def _attention_mask(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor,
+    ):
+        """Causal mask, limited to ``config.attention_window`` tokens when set.
+
+        The window counts the query token itself, like vLLM's sliding window.
+        """
+        make_mask = (
+            create_causal_mask
+            if self.config.attention_window is None
+            else create_sliding_window_causal_mask
+        )
+        return make_mask(
+            config=self._mask_config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+
     @classmethod
     def from_training_args(  # type: ignore[override]
         cls,
@@ -285,6 +331,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         *,
         num_speculative_steps: int = 3,
         verifier_name_or_path: str | None = None,
+        mtp_attention_window: int | None = None,
         **kwargs: Any,  # noqa: ARG003
     ) -> "MTPDraftModel":
         if verifier_name_or_path is None:
@@ -296,6 +343,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
 
         config = MTPSpeculatorConfig(
             transformer_layer_config=verifier_config,
+            attention_window=mtp_attention_window,
             speculators_config=SpeculatorsConfig(
                 algorithm="mtp",
                 proposal_methods=[

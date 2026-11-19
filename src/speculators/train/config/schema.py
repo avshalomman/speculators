@@ -680,6 +680,13 @@ class MTPArgs(_Group):
         description="Exponential decay factor for MTP step weights; higher weights "
         "earlier prediction steps more. Only used with MTP.",
     )
+    mtp_attention_window: int | None = Field(
+        default=None,
+        gt=0,
+        description="Limit the MTP attention to this many tokens, the query "
+        "included (default: the whole prefix). Saved in the head's config, and "
+        "`speculators stitch` passes it to vLLM as `mtp_sliding_window`.",
+    )
 
 
 # Group attribute name -> group model. Order defines both the flatten() key order

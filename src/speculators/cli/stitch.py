@@ -6,7 +6,8 @@ the trained weights back into the original verifier checkpoint, producing a
 self-contained checkpoint directory deployable on vLLM.
 
 Frozen weights (embed_tokens, lm_head) are skipped -- only the MTP layer
-weights are replaced.
+weights are replaced. A head trained with an attention window gets it written
+into the verifier's (text) config as ``mtp_sliding_window``; vLLM reads that key.
 
 Usage::
 
@@ -261,6 +262,47 @@ def _stitch_single(
     save_file(existing, str(safetensors_path), metadata=metadata)
 
 
+def _verifier_keeps_fused_experts(
+    verifier_path: Path, native_weights: dict[str, torch.Tensor]
+) -> bool:
+    """Whether the verifier stores MoE experts as the packed 3D tensors the head has.
+
+    Qwen3.5/3.6 checkpoints store ``experts.gate_up_proj`` and
+    ``experts.down_proj`` packed, so those keys are written back as they are;
+    a verifier with per-expert keys gets them unfused.
+    """
+    fused = [
+        key
+        for key in native_weights
+        if _FUSED_GATE_UP_PATTERN.match(key) or _FUSED_DOWN_PATTERN.match(key)
+    ]
+    index_path = verifier_path / "model.safetensors.index.json"
+    if not fused or not index_path.exists():
+        return False
+    weight_map = json.loads(index_path.read_text())["weight_map"]
+    return all(key in weight_map for key in fused)
+
+
+def _write_attention_window(finetuned_checkpoint: Path, config_path: Path) -> None:
+    """Copy the head's ``attention_window`` into the stitched config.
+
+    A head without one removes any ``mtp_sliding_window`` the verifier carried.
+
+    The key goes where vLLM's MTP reads its text config: ``text_config`` for a
+    multimodal verifier, the top level otherwise.
+    """
+    head_config = json.loads((finetuned_checkpoint / "config.json").read_text())
+    window = head_config.get("attention_window")
+    config = json.loads(config_path.read_text())
+    target = config.get("text_config", config)
+    if window is None:
+        target.pop("mtp_sliding_window", None)
+    else:
+        target["mtp_sliding_window"] = window
+        console.print(f"  MTP attention window: [cyan]{window}[/] tokens")
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+
 def stitch(
     finetuned_checkpoint: Path,
     verifier_path: Path,
@@ -289,8 +331,10 @@ def stitch(
             f"  Skipped [yellow]{frozen_count}[/] frozen key(s) (embed_tokens, lm_head)"
         )
 
-    weights = _unfuse_moe_experts(weights)
     native_weights = {_remap_key(k): v for k, v in weights.items()}
+    if not _verifier_keeps_fused_experts(verifier_path, native_weights):
+        weights = _unfuse_moe_experts(weights)
+        native_weights = {_remap_key(k): v for k, v in weights.items()}
     console.print(f"  Remapped [cyan]{len(native_weights)}[/] keys to native format")
 
     if output_path.exists():
@@ -301,6 +345,8 @@ def stitch(
     with _spinner() as progress:
         progress.add_task("Copying verifier checkpoint", total=None)
         shutil.copytree(verifier_path, output_path, dirs_exist_ok=True)
+
+    _write_attention_window(finetuned_checkpoint, output_path / "config.json")
 
     index_path = output_path / "model.safetensors.index.json"
     if index_path.exists():
