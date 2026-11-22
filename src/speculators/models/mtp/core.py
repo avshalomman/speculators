@@ -127,6 +127,10 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         # SDPA, not eager — eager OOMs on long sequences (#886).
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
             config.transformer_layer_config._attn_implementation = "sdpa"  # noqa: SLF001
+        # cuDNN's attention kernel failed on a 16k-token pack with the causal mask
+        # (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED, torch 2.14.1 / cuDNN 9.24), so
+        # PyTorch picks among its own kernels instead.
+        torch.backends.cuda.enable_cudnn_sdp(False)
         super().__init__(config=config)
         self._init_vocab(config)
         if self.use_draft_vocab:
