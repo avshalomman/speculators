@@ -687,6 +687,14 @@ class MTPArgs(_Group):
         "included (default: the whole prefix). Saved in the head's config, and "
         "`speculators stitch` passes it to vLLM as `mtp_sliding_window`.",
     )
+    mtp_max_loss_positions: int | None = Field(
+        default=2048,
+        gt=0,
+        description="Compute MTP logits and loss at no more than this many "
+        "supervised positions per step and pack; the metric "
+        "`loss_positions_dropped` is the share left out. None scores every "
+        "position, which takes 15 GiB per step for a 16k-token pack.",
+    )
 
 
 # Group attribute name -> group model. Order defines both the flatten() key order

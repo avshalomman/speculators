@@ -103,7 +103,14 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
     frozen ``verifier_norm`` (loaded from the verifier, never saved). With
     ``config.attention_window`` set, the MTP attention sees only that many
     tokens, as vLLM does when the stitched config carries ``mtp_sliding_window``.
+
+    ``max_loss_positions`` (training only, not saved) limits the LM head to that
+    many supervised positions per step. Logits over the full vocabulary at every
+    position of a 16k-token pack take 15 GiB per step in fp32, while the loss
+    mask supervises only the last assistant turn of each row.
     """
+
+    max_loss_positions: int | None = None
 
     config_class: ClassVar[type[MTPSpeculatorConfig]] = MTPSpeculatorConfig  # type: ignore[misc]
     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
@@ -220,7 +227,9 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         :param return_dict: Unused, kept for interface compatibility.
         :param kwargs: Absorbs unexpected batch keys
             (lengths, verifier_last_hidden_states)
-        :return: Tuple of (logits_list, loss, metrics)
+        :return: Tuple of (logits_list, loss, metrics). With a loss mask and
+            ``max_loss_positions`` set, each logits tensor covers only the
+            selected positions.
         """
         input_ids = input_ids.long()
         device = input_ids.device
@@ -262,6 +271,8 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
             hidden_states[:, :valid_len], attention_mask, step_pos_ids
         )
 
+        positions_dropped = torch.tensor(0, device=device)
+        positions_supervised = torch.tensor(0, device=device)
         current_hidden = self.verifier_norm(hidden_states)
         for step in range(effective_steps):
             step_hidden = current_hidden[:, :valid_len]
@@ -278,14 +289,33 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
                 position_embeddings=step_pos_emb,
             )
 
-            logits = self.lm_head(mtp_output)
-            all_logits.append(logits)
-
             step_targets = input_ids[:, step + 2 : step + 2 + valid_len]
             if loss_mask is not None:
                 step_mask = loss_mask[:, step + 2 : step + 2 + valid_len]
                 step_targets = step_targets.clone()
                 step_targets[step_mask == 0] = _IGNORE_INDEX
+
+            head_input = mtp_output
+            if loss_mask is not None and self.max_loss_positions is not None:
+                supervised = step_targets != _IGNORE_INDEX
+                # A fixed count keeps shapes static for torch.compile. topk puts
+                # the supervised positions first; the rest keep the ignore index.
+                keep = torch.topk(
+                    supervised.to(torch.uint8),
+                    min(self.max_loss_positions, valid_len),
+                    dim=1,
+                ).indices
+                head_input = mtp_output.gather(
+                    1, keep.unsqueeze(-1).expand(-1, -1, mtp_output.shape[-1])
+                )
+                step_targets = step_targets.gather(1, keep)
+                dropped = supervised.sum() - (step_targets != _IGNORE_INDEX).sum()
+                positions_dropped = positions_dropped + dropped
+                positions_supervised = positions_supervised + supervised.sum()
+
+            logits = self.lm_head(head_input)
+            all_logits.append(logits)
+
             weight = step_weights[step] if step_weights is not None else 1.0
             unreduced = nn.functional.cross_entropy(
                 logits.permute(0, 2, 1),
@@ -302,6 +332,10 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
 
         metrics["loss_sum"] = total_loss.detach().clone()
         metrics["loss_total"] = torch.tensor(1.0, device=device)
+        if loss_mask is not None and self.max_loss_positions is not None:
+            # Share of supervised positions left out of the loss by the limit.
+            metrics["loss_positions_dropped_sum"] = positions_dropped.float()
+            metrics["loss_positions_dropped_total"] = positions_supervised.float()
 
         return (all_logits, total_loss, metrics)
 
@@ -336,6 +370,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         num_speculative_steps: int = 3,
         verifier_name_or_path: str | None = None,
         mtp_attention_window: int | None = None,
+        mtp_max_loss_positions: int | None = None,
         **kwargs: Any,  # noqa: ARG003
     ) -> "MTPDraftModel":
         if verifier_name_or_path is None:
@@ -375,6 +410,7 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
         model.load_state_dict(state_dict, strict=False)
 
         model.load_verifier_weights()
+        model.max_loss_positions = mtp_max_loss_positions
         return model
 
     @staticmethod
