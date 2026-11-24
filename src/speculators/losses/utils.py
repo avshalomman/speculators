@@ -112,6 +112,93 @@ def dpace_loss_decay(
     return weight.reshape(1, -1)
 
 
+def recorded_token_accept_prob(
+    logits: torch.Tensor,  # [1, T, V] draft logits
+    targets: torch.Tensor,  # [1, T, V] verifier logits
+    token_ids: torch.Tensor,  # [1, T] recorded token each slot predicts
+    temperature: float = 1.0,
+    chunk: int = 1024,
+) -> torch.Tensor:
+    """Probability that a sampled draft was accepted, given the recorded token.
+
+    Speculative sampling draws ``x ~ q`` and accepts it with ``min(1, p(x)/q(x))``.
+    Given that the verifier emitted the recorded token ``y``, the draft was
+    accepted with probability ``min(1, q(y) / p(y))``. Both distributions are the
+    raw logits divided by ``temperature``; top-k and top-p are not applied.
+
+    Args:
+        logits: Draft logits.
+        targets: Verifier logits, aligned with ``logits``.
+        token_ids: Recorded token of each slot, in the vocabulary of the logits.
+        temperature: Sampling temperature applied to both distributions.
+        chunk: Slots per step of the vocabulary-wide normalization.
+
+    Returns:
+        Detached acceptance probabilities in ``[0, 1]`` with shape ``[1, T]``.
+    """
+    seq_len = logits.shape[1]
+    accept = torch.empty(seq_len, dtype=torch.float32, device=logits.device)
+    with torch.no_grad():
+        for start in range(0, seq_len, chunk):
+            end = min(start + chunk, seq_len)
+            ids = token_ids[0, start:end, None].long()
+            log_ratio = _token_log_prob(
+                logits[0, start:end], ids, temperature
+            ) - _token_log_prob(targets[0, start:end], ids, temperature)
+            accept[start:end] = log_ratio.clamp(max=0.0).exp()
+    return accept.unsqueeze(0)
+
+
+def survival_loss_decay(
+    pos_idx: torch.Tensor | None,  # noqa: ARG001
+    loss_mask: torch.Tensor,
+    block_size: int,
+    survival_lambda: float,
+    accept_prob: torch.Tensor,
+    **_kwargs,
+):
+    """Per-slot weight: the chance that serving reaches the slot on the recorded path.
+
+    ``w_k = prod_{i<k} ((1 - lambda) * s_i + lambda)`` within each block, where
+    ``s_i`` is ``accept_prob`` at slot ``i``. Slot 0 has weight 1. A slot outside
+    the loss mask gets weight 0 and contributes a factor of 1 to later slots.
+    ``lambda=1`` gives every supervised slot weight 1; ``lambda=0`` is the plain
+    survival probability.
+
+    Args:
+        loss_mask: Supervised slots, ``[1, T]``.
+        block_size: Slots per block; ``T`` must be a multiple of it.
+        survival_lambda: Mixing constant in ``[0, 1]``.
+        accept_prob: Output of :func:`recorded_token_accept_prob`, ``[1, T]``.
+
+    Returns:
+        Detached weight tensor with shape ``[1, T]``.
+    """
+    with torch.no_grad():
+        if accept_prob.shape[1] % block_size != 0:
+            raise ValueError(
+                f"accept_prob.shape[1] ({accept_prob.shape[1]}) must be divisible "
+                f"by block_size ({block_size})"
+            )
+        accept = accept_prob.float().reshape(-1, block_size)
+        mask = loss_mask.reshape(-1, block_size).to(accept.dtype)
+        smooth = (1.0 - survival_lambda) * accept + survival_lambda
+        smooth = torch.where(mask > 0, smooth, torch.ones_like(smooth))
+        prefix = torch.cumprod(smooth, dim=-1)
+        weight = torch.cat([torch.ones_like(prefix[:, :1]), prefix[:, :-1]], dim=-1)
+        weight = weight * mask
+    return weight.reshape(1, -1)
+
+
+def _token_log_prob(
+    rows: torch.Tensor,  # [N, V]
+    ids: torch.Tensor,  # [N, 1]
+    temperature: float,
+) -> torch.Tensor:
+    scaled = rows.float() / temperature
+    return scaled.gather(-1, ids).squeeze(-1) - torch.logsumexp(scaled, dim=-1)
+
+
 def _fused_kernel(name: str):
     """Import a fused loss by name."""
     try:

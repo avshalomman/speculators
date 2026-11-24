@@ -38,6 +38,23 @@ Pass a JSON dict to train on a weighted sum of several losses. Weights are used 
 speculators train ... --loss-fn '{"ce": 0.1, "tv": 0.9}'
 ```
 
+## Survival Position Weighting
+
+`--per-position-loss-weight survival` (DSpark, full vocabulary) weights slot `k` of a block by the probability that serving reaches it along the recorded tokens `y`:
+
+```
+w_k = prod_{i<k} ((1 - lambda) * s_i + lambda),    s_i = min(1, q_i(y_i) / p_i(y_i))
+```
+
+`s_i` is the probability that a sampled draft was accepted at slot `i`, given that the verifier emitted `y_i`. `q` and `p` are the draft and verifier distributions from the raw logits divided by `--survival-temperature`. No gradient flows through `w_k`, and the exponential position decay is not applied to the token loss. The confidence loss uses the same weight `w_k`. Any `--loss-fn` works. `--survival-lambda 1` gives every slot weight 1.
+
+Training logs `survival_weight` (mean slot weight) and `survival_accept` (mean `s_i`) over supervised slots.
+
+```bash
+speculators train ... --speculator-type dspark --loss-fn '{"ce": 0.1, "tv": 0.9}' \
+  --per-position-loss-weight survival --survival-lambda 0.5 --survival-temperature 1.0
+```
+
 ## References
 
 - Lin, "Divergence measures based on the Shannon entropy" (1991) -- Jensen-Shannon divergence

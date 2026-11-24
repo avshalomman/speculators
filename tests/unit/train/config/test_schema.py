@@ -179,3 +179,42 @@ def test_from_flat_accepts_partial_working_dict():
     assert recovered.draft.num_layers == 6
     # Untouched fields fall back to their schema defaults.
     assert recovered.trainer.epochs == 20
+
+
+def test_survival_weight_fields_flatten_with_defaults():
+    flat = TrainConfig(
+        speculator_type="dspark",
+        dflash=DFlashArgs(per_position_loss_weight="survival"),
+    ).flatten()
+    assert flat["per_position_loss_weight"] == "survival"
+    assert flat["survival_lambda"] == pytest.approx(0.5)
+    assert flat["survival_temperature"] == pytest.approx(1.0)
+
+
+def test_survival_weight_is_dspark_only():
+    with pytest.raises(ValueError, match="dspark"):
+        TrainConfig(
+            speculator_type="dflash",
+            loss=LossArgs(loss_fn="ce"),
+            dflash=DFlashArgs(per_position_loss_weight="survival"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("survival_lambda", -0.1),
+        ("survival_lambda", 1.1),
+        ("survival_temperature", 0.0),
+    ],
+)
+def test_survival_weight_rejects_out_of_range_values(field, value):
+    with pytest.raises(ValueError, match=field.replace("_", "-")):
+        TrainConfig(
+            speculator_type="dspark",
+            dflash=DFlashArgs(per_position_loss_weight="survival", **{field: value}),
+        )
+
+
+def test_survival_values_are_not_checked_when_unused():
+    TrainConfig(speculator_type="dspark", dflash=DFlashArgs(survival_lambda=5.0))

@@ -6,7 +6,11 @@ import pytest
 import torch
 from torch.nn.functional import binary_cross_entropy_with_logits
 
-from speculators.losses import resolve_loss_config
+from speculators.losses import (
+    recorded_token_accept_prob,
+    resolve_loss_config,
+    survival_loss_decay,
+)
 from speculators.losses.eager import tv_loss
 from speculators.models.dspark.metrics import compute_metrics as _compute_metrics
 
@@ -289,3 +293,171 @@ class TestComputeMetrics:
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)
         assert all(torch.is_tensor(v) for v in metrics.values())
+
+
+def _log_probs(probs: list[list[float]]) -> torch.Tensor:
+    return torch.tensor(probs).log().unsqueeze(0)
+
+
+class TestSurvivalWeight:
+    """Chain-survival slot weight: w_k = prod_{i<k} ((1-lam) * s_i + lam) with
+    s_i = min(1, q_i(y_i) / p_i(y_i)) for the recorded token y_i."""
+
+    def test_accept_prob_uses_recorded_token_and_caps_at_one(self):
+        # Slot 0: q(y)=0.2, p(y)=0.8 -> 0.25. Slot 1: q(y)=0.9 > p(y)=0.3 -> 1.
+        # The recorded token (index 1) is not the verifier's top token in slot 1.
+        logits = _log_probs([[0.8, 0.2, 0.0001], [0.1, 0.9, 0.0001]])
+        targets = _log_probs([[0.2, 0.8, 0.0001], [0.7, 0.3, 0.0001]])
+        ids = torch.tensor([[1, 1]])
+        accept = recorded_token_accept_prob(logits, targets, ids)
+        assert accept.shape == (1, 2)
+        assert accept[0].tolist() == pytest.approx([0.25, 1.0], abs=1e-3)
+
+    def test_accept_prob_applies_temperature_to_both_distributions(self):
+        logits = torch.tensor([[[2.0, 0.0, -1.0]]])
+        targets = torch.tensor([[[0.0, 3.0, 1.0]]])
+        ids = torch.tensor([[0]])
+        for temperature in (0.5, 2.0):
+            q = torch.softmax(logits / temperature, -1)[0, 0, 0]
+            p = torch.softmax(targets / temperature, -1)[0, 0, 0]
+            accept = recorded_token_accept_prob(
+                logits, targets, ids, temperature=temperature
+            )
+            assert accept.item() == pytest.approx(min(1.0, (q / p).item()), rel=1e-5)
+
+    def test_accept_prob_is_independent_of_chunk_size(self):
+        torch.manual_seed(0)
+        logits, targets = torch.randn(1, 13, 32), torch.randn(1, 13, 32)
+        ids = torch.randint(0, 32, (1, 13))
+        whole = recorded_token_accept_prob(logits, targets, ids, chunk=64)
+        chunked = recorded_token_accept_prob(logits, targets, ids, chunk=4)
+        assert torch.allclose(whole, chunked, atol=1e-6)
+
+    def test_weight_is_exclusive_product_restarting_per_block(self):
+        # Two blocks of 3 slots. The slot's own acceptance never enters its weight,
+        # and the second block starts again at 1.
+        accept = torch.tensor([[0.5, 0.2, 0.9, 0.0, 1.0, 1.0]])
+        mask = torch.ones(1, 6)
+        weight = survival_loss_decay(
+            None, loss_mask=mask, block_size=3, survival_lambda=0.0, accept_prob=accept
+        )
+        assert weight[0].tolist() == pytest.approx([1.0, 0.5, 0.1, 1.0, 0.0, 0.0])
+
+    def test_lambda_mixes_acceptance_with_one(self):
+        accept = torch.tensor([[0.0, 0.5, 1.0]])
+        mask = torch.ones(1, 3)
+        half = survival_loss_decay(
+            None, loss_mask=mask, block_size=3, survival_lambda=0.5, accept_prob=accept
+        )
+        assert half[0].tolist() == pytest.approx([1.0, 0.5, 0.375])
+        uniform = survival_loss_decay(
+            None, loss_mask=mask, block_size=3, survival_lambda=1.0, accept_prob=accept
+        )
+        assert uniform[0].tolist() == pytest.approx([1.0, 1.0, 1.0])
+
+    def test_unsupervised_slot_neither_gets_weight_nor_cuts_the_chain(self):
+        accept = torch.tensor([[0.5, 0.0, 0.5]])
+        mask = torch.tensor([[1.0, 0.0, 1.0]])
+        weight = survival_loss_decay(
+            None, loss_mask=mask, block_size=3, survival_lambda=0.0, accept_prob=accept
+        )
+        assert weight[0].tolist() == pytest.approx([1.0, 0.0, 0.5])
+
+    def test_loss_has_no_position_decay_and_no_gradient_through_the_weight(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 6, 16, requires_grad=True)
+        targets = torch.randn(1, 6, 16)
+        ids = torch.randint(0, 16, (1, 6))
+        mask = torch.ones(1, 6)
+        ce_only = resolve_loss_config("ce", "eager")
+        kwargs = {
+            "block_size": 3,
+            "loss_config": ce_only,
+            "per_position_loss_weight": "survival",
+            "recorded_token_ids": ids,
+        }
+        # lambda=1: every weight is 1, so the loss is the plain masked mean; a
+        # gamma that would change a position decay must change nothing.
+        loss, _ = compute_metrics(
+            logits, targets, None, mask, survival_lambda=1.0, gamma=0.1, **kwargs
+        )
+        plain = resolve_loss_config("ce", "eager")["ce"][0](logits, targets).mean()
+        assert loss.item() == pytest.approx(plain.item(), rel=1e-4)
+
+        # lambda=0: the gradient equals that of the loss with the weight held fixed.
+        loss, metrics = compute_metrics(
+            logits, targets, None, mask, survival_lambda=0.0, **kwargs
+        )
+        (grad,) = torch.autograd.grad(loss, logits)
+        accept = recorded_token_accept_prob(logits.detach(), targets, ids)
+        weight = survival_loss_decay(
+            None, loss_mask=mask, block_size=3, survival_lambda=0.0, accept_prob=accept
+        )
+        elementwise = ce_only["ce"][0](logits, targets)
+        (expected,) = torch.autograd.grad((elementwise * weight).mean(), logits)
+        assert torch.allclose(grad, expected, atol=1e-6)
+        assert metrics["survival_weight_sum"] / metrics[
+            "survival_weight_total"
+        ] == pytest.approx(weight.mean().item(), rel=1e-5)
+
+    def test_survival_requires_recorded_tokens(self):
+        logits, targets = torch.randn(1, 4, 8), torch.randn(1, 4, 8)
+        with pytest.raises(ValueError, match="recorded_token_ids"):
+            compute_metrics(
+                logits,
+                targets,
+                None,
+                torch.ones(1, 4),
+                block_size=2,
+                loss_config=_DEFAULT_LOSS,
+                per_position_loss_weight="survival",
+            )
+
+    def test_confidence_loss_uses_the_survival_weight(self):
+        torch.manual_seed(0)
+        logits, targets = torch.randn(1, 6, 16), torch.randn(1, 6, 16)
+        confidence_logits = torch.randn(1, 6)
+        ids = torch.randint(0, 16, (1, 6))
+        mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 1.0]])
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+            per_position_loss_weight="survival",
+            recorded_token_ids=ids,
+            survival_lambda=0.0,
+            gamma=0.1,
+        )
+        weight = survival_loss_decay(
+            None,
+            loss_mask=mask,
+            block_size=3,
+            survival_lambda=0.0,
+            accept_prob=recorded_token_accept_prob(logits, targets, ids),
+        )
+        bce = binary_cross_entropy_with_logits(
+            confidence_logits, 1.0 - tv_loss(logits, targets), reduction="none"
+        )
+        expected = (bce * weight).sum() / mask.sum()
+        assert metrics["confidence_loss_sum"].item() == pytest.approx(
+            expected.item(), rel=1e-5
+        )
+
+    def test_empty_loss_mask_gives_zero_loss(self):
+        logits = torch.randn(1, 8, 16, requires_grad=True)
+        loss, _ = compute_metrics(
+            logits,
+            torch.randn(1, 8, 16),
+            None,
+            torch.zeros(1, 8),
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            per_position_loss_weight="survival",
+            recorded_token_ids=torch.zeros(1, 8, dtype=torch.long),
+        )
+        loss.backward()
+        assert loss.item() == 0
+        assert torch.count_nonzero(logits.grad) == 0

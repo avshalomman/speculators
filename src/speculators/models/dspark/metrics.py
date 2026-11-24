@@ -23,6 +23,8 @@ from speculators.losses import (
     compound_loss,
     dflash_loss_decay,
     dpace_loss_decay,
+    recorded_token_accept_prob,
+    survival_loss_decay,
     tv_loss,
 )
 from speculators.models.metrics import (
@@ -68,14 +70,43 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    recorded_token_ids: torch.Tensor | None = None,  # [1, T]
+    survival_lambda: float = 0.5,
+    survival_temperature: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
+    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs).
+
+    ``per_position_loss_weight="survival"`` replaces the position decay of the
+    token loss with :func:`speculators.losses.survival_loss_decay`, computed from
+    ``recorded_token_ids`` (the token each slot predicts, in the vocabulary of the
+    logits). The confidence loss uses the same weight.
+    """
 
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
     start_pos = 0 if sample_from_anchor else 1
-    if per_position_loss_weight == "dpace":
+    survival_weight = None
+    if per_position_loss_weight == "survival":
+        if recorded_token_ids is None:
+            raise ValueError(
+                "per_position_loss_weight='survival' requires recorded_token_ids."
+            )
+        survival_accept = recorded_token_accept_prob(
+            logits, targets, recorded_token_ids, temperature=survival_temperature
+        )
+        survival_weight = survival_loss_decay(
+            pos_idx,
+            loss_mask=loss_mask,
+            block_size=block_size,
+            survival_lambda=survival_lambda,
+            accept_prob=survival_accept,
+        )
+
+        def decay_fn(_pos_idx: torch.Tensor, **_kwargs) -> torch.Tensor:
+            return survival_weight
+
+    elif per_position_loss_weight == "dpace":
         decay_fn = partial(
             dpace_loss_decay,
             loss_mask=loss_mask,
@@ -110,9 +141,14 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        # D-PACE expects token CE, so keep the confidence BCE on fixed decay.
-        confidence_decay_fn = partial(
-            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+        # D-PACE expects token CE, so it keeps the confidence BCE on fixed decay.
+        # The survival weight does not depend on the loss term and applies to both.
+        confidence_decay_fn = (
+            decay_fn
+            if survival_weight is not None
+            else partial(
+                dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+            )
         )
         conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, confidence_decay_fn)
         loss = loss + confidence_head_alpha * conf_loss
@@ -146,6 +182,16 @@ def compute_metrics(
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()
+
+    if survival_weight is not None:
+        # Mean slot weight and mean acceptance of the recorded token, over
+        # supervised slots.
+        mask_f = loss_mask.to(survival_weight.dtype)
+        mask_total = mask_f.sum().clamp_min(1.0)
+        metrics["survival_weight_sum"] = survival_weight.sum()
+        metrics["survival_weight_total"] = mask_total
+        metrics["survival_accept_sum"] = (survival_accept * mask_f).sum()
+        metrics["survival_accept_total"] = mask_total.clone()
 
     # Mean acceptance rate of the (Markov-corrected) drafter.
     with torch.no_grad():

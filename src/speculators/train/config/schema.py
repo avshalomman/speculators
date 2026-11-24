@@ -523,15 +523,31 @@ class DFlashArgs(_Group):
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
     )
-    per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
-        default=None,
-        description="Per-position loss weight option for D-PACE support "
-        "(default: dpace for dflash, fixed-exp-decay otherwise).",
+    per_position_loss_weight: Literal["fixed-exp-decay", "dpace", "survival"] | None = (
+        Field(
+            default=None,
+            description="Per-position loss weight option "
+            "(default: dpace for dflash, fixed-exp-decay otherwise). 'survival' "
+            "(dspark only) weights each slot by the probability that sampled drafts "
+            "were accepted at every earlier slot of its block. The weight replaces "
+            "the position decay of the token loss and of the confidence loss.",
+        )
     )
     dpace_alpha: float = Field(
         default=0.5,
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
+    )
+    survival_lambda: float = Field(
+        default=0.5,
+        description="Mixing constant for --per-position-loss-weight=survival: an "
+        "earlier slot contributes (1 - lambda) * min(1, q(y)/p(y)) + lambda to the "
+        "weight of later slots. Must be in [0, 1]; 1 weights all slots equally.",
+    )
+    survival_temperature: float = Field(
+        default=1.0,
+        description="Temperature applied to the draft and verifier logits when "
+        "--per-position-loss-weight=survival computes q(y) and p(y). Must be > 0.",
     )
 
 
@@ -900,6 +916,29 @@ class TrainConfig(BaseSettings):
             if not 0.0 < self.dflash.dpace_alpha <= 1.0:
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_survival(self) -> "TrainConfig":
+        """Survival loss weighting is implemented for DSpark and needs a mixing
+        constant in ``[0, 1]`` and a positive temperature. Only enforced when
+        selected."""
+        if self.dflash.per_position_loss_weight == "survival":
+            if self.speculator_type != "dspark":
+                raise ValueError(
+                    "--per-position-loss-weight=survival requires "
+                    "--speculator-type=dspark"
+                )
+            if not 0.0 <= self.dflash.survival_lambda <= 1.0:
+                raise ValueError(
+                    "--survival-lambda must be in [0, 1], got "
+                    f"{self.dflash.survival_lambda}"
+                )
+            if self.dflash.survival_temperature <= 0.0:
+                raise ValueError(
+                    "--survival-temperature must be > 0, got "
+                    f"{self.dflash.survival_temperature}"
                 )
         return self
 

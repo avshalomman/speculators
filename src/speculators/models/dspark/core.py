@@ -134,6 +134,8 @@ class DSparkDraftModel(DFlashDraftModel):
             "per_position_loss_weight", "fixed-exp-decay"
         )
         dpace_alpha = kwargs.get("dpace_alpha", 0.5)
+        survival_lambda = kwargs.get("survival_lambda", 0.5)
+        survival_temperature = kwargs.get("survival_temperature", 1.0)
         shared = {
             "loss_config": loss_config,
             "tv_loss_fn": tv_loss_fn,
@@ -142,6 +144,8 @@ class DSparkDraftModel(DFlashDraftModel):
             "confidence_head_alpha": confidence_head_alpha,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "survival_lambda": survival_lambda,
+            "survival_temperature": survival_temperature,
         }
         return dict(shared), dict(shared)
 
@@ -161,6 +165,8 @@ class DSparkDraftModel(DFlashDraftModel):
         confidence_head_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        survival_lambda: float = 0.5,
+        survival_temperature: float = 1.0,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -247,6 +253,23 @@ class DSparkDraftModel(DFlashDraftModel):
                 1, mask_tokens_size
             )
 
+        recorded_token_ids = None
+        if per_position_loss_weight == "survival":
+            if self.use_draft_vocab:
+                raise ValueError(
+                    "per_position_loss_weight='survival' requires the full "
+                    "vocabulary: recorded tokens outside a reduced draft vocabulary "
+                    "have no draft probability."
+                )
+            # Token that each slot predicts; aligned_loss_mask covers the same
+            # positions, and select_anchors keeps the shift in range.
+            recorded_indices = (
+                anchored_block_indices + 1
+                if self.config.sample_from_anchor
+                else anchored_block_indices
+            )
+            recorded_token_ids = input_ids[:, recorded_indices]
+
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -260,6 +283,9 @@ class DSparkDraftModel(DFlashDraftModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            recorded_token_ids=recorded_token_ids,
+            survival_lambda=survival_lambda,
+            survival_temperature=survival_temperature,
         )
         metrics.update(rescore_metrics)
         return None, loss, metrics

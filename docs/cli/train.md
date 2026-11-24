@@ -187,9 +187,13 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash-family loss weighting.
 
-- **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` otherwise) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`. Applies to DFlash-family models. `dpace` requires `--loss-fn ce`.
+- **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` otherwise) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`, `survival`. Applies to DFlash-family models. `dpace` requires `--loss-fn ce`. `survival` requires `--speculator-type dspark` and the full vocabulary; it weights each slot by the probability that sampled drafts were accepted at every earlier slot of its block, and applies no position decay.
 
 - **`--dpace-alpha`** (float, default: `0.5`) Confidence smoothing constant for the D-PACE loss. Only used with `--per-position-loss-weight dpace`.
+
+- **`--survival-lambda`** (float, default: `0.5`) Mixing constant for `--per-position-loss-weight survival`, in `[0, 1]`. An earlier slot contributes `(1 - lambda) * min(1, q(y)/p(y)) + lambda` to the weight of later slots; `1` weights all slots equally.
+
+- **`--survival-temperature`** (float, default: `1.0`) Temperature applied to the draft and verifier logits when the survival weight computes `q(y)` and `p(y)`. Top-k and top-p are not applied.
 
 ### DFlash2-Specific Arguments
 
